@@ -1,0 +1,5 @@
+{"version":1,"header":{"slots":null,"params":null},"db":{"version":2,"entries":[
+  {"type":"totp","uuid":"a1","name":"aegis-user","issuer":"AegisCo","note":"imported",
+   "info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA256","digits":8,"period":60}},
+  {"type":"hotp","uuid":"a2","name":"aegis-hotp","issuer":"AegisCo",
+   "info":{"secret":"JBSWY3DPEHPK3PXP","algo":"SHA1","digits":6,"counter":9}}]}}

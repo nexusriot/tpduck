@@ -1,0 +1,37 @@
+{
+  "version": "@VERSION@",
+  "description": "Terminal TOTP, HOTP and Steam Guard authenticator with an encrypted vault",
+  "homepage": "https://github.com/nexusriot/tpduck",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/nexusriot/tpduck/releases/download/v@VERSION@/tpduck_v@VERSION@_windows_amd64.zip",
+      "hash": "@SHA_WINDOWS_AMD64@",
+      "extract_dir": "tpduck_v@VERSION@_windows_amd64"
+    },
+    "arm64": {
+      "url": "https://github.com/nexusriot/tpduck/releases/download/v@VERSION@/tpduck_v@VERSION@_windows_arm64.zip",
+      "hash": "@SHA_WINDOWS_ARM64@",
+      "extract_dir": "tpduck_v@VERSION@_windows_arm64"
+    }
+  },
+  "bin": "tpduck.exe",
+  "checkver": {
+    "github": "https://github.com/nexusriot/tpduck"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/nexusriot/tpduck/releases/download/v$version/tpduck_v$version_windows_amd64.zip",
+        "extract_dir": "tpduck_v$version_windows_amd64"
+      },
+      "arm64": {
+        "url": "https://github.com/nexusriot/tpduck/releases/download/v$version/tpduck_v$version_windows_arm64.zip",
+        "extract_dir": "tpduck_v$version_windows_arm64"
+      }
+    },
+    "hash": {
+      "url": "$baseurl/SHA256SUMS"
+    }
+  }
+}

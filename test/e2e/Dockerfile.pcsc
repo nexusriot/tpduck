@@ -1,0 +1,48 @@
+# End-to-end image for the smart-card path.
+#
+# The default tpduck binaries are pure Go and have no smart-card support, so
+# the PC/SC transport is never exercised by the ordinary suite. This image
+# builds with -tags pcsc (which needs cgo and libpcsclite) and runs it against
+# a *virtual* YubiKey: pcscd loads the vpcd driver, our vicc process connects
+# to vpcd and serves the simulated OATH applet, and tpduck talks to it through
+# the real libpcsclite -> pcscd -> vpcd chain.
+#
+# Everything is local, so scripts/e2e-pcsc.sh runs it with --network none.
+
+FROM golang:1.25-bookworm AS build
+WORKDIR /src
+
+# libpcsclite-dev is a *build* requirement: the cgo binding links against it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpcsclite-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=e2e-pcsc
+RUN CGO_ENABLED=1 go build -trimpath -tags pcsc \
+      -ldflags "-s -w -X github.com/nexusriot/tpduck/internal/version.Override=${VERSION}" -o /out/tpduck ./cmd/tpduck \
+ && CGO_ENABLED=0 go build -trimpath -o /out/vicc ./test/e2e/vicc
+
+FROM debian:bookworm-slim
+
+# pcscd is the daemon, libpcsclite1 the runtime library the binary links
+# against, and vsmartcard-vpcd the driver that turns a TCP port into a reader.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      pcscd libpcsclite1 vsmartcard-vpcd procps \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/tpduck /usr/bin/tpduck
+COPY --from=build /out/vicc   /usr/bin/vicc
+COPY test/e2e/run-pcsc.sh     /usr/bin/e2e-pcsc
+RUN chmod +x /usr/bin/e2e-pcsc
+
+# pcscd wants to own /run/pcscd, so this suite runs as root. The unprivileged
+# behaviour of tpduck itself is covered by the main end-to-end image.
+ENV HOME=/root XDG_CONFIG_HOME=/root/.config
+WORKDIR /root
+
+ENTRYPOINT ["/usr/bin/e2e-pcsc"]

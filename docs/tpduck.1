@@ -1,0 +1,286 @@
+.TH TPDUCK 1 "2026" "tpduck" "User Commands"
+.SH NAME
+tpduck \- terminal TOTP/HOTP authenticator
+.SH SYNOPSIS
+.B tpduck
+.RI [ flags ]
+.br
+.B tpduck
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B tpduck
+generates two-factor authentication codes in the terminal. Run without a
+command it opens an interactive UI; with a command it behaves as an ordinary
+CLI tool suitable for scripts.
+.PP
+Accounts live in a vault, by default
+.IR $XDG_CONFIG_HOME/tpduck/accounts.json ,
+written with mode 0600. The vault can be encrypted with a passphrase, after
+which it is an authenticated envelope using Argon2id and XChaCha20-Poly1305.
+.PP
+A
+.I query
+naming an account is an exact ID, an exact
+.IR Issuer:name " label,"
+or any unique case-insensitive substring. An ambiguous query is refused rather
+than guessed.
+.SH COMMANDS
+.TP
+.BI code " query"
+Print the current code. For a counter-based (HOTP) account this also advances
+the counter, because such codes are single-use.
+.TP
+.BI verify " query code"
+Report whether a code is one this account currently produces. Exits non-zero
+when it is not.
+.TP
+.BI resync " query code"
+Find the counter that produces a code and move an HOTP account just past it,
+searching both directions.
+.TP
+.B list
+List accounts. Never prints secrets.
+.TP
+.BI add " uri|file|image.png"
+Import an
+.IR otpauth:// " URI, an " otpauth-migration:// " export,"
+a backup from another authenticator, or a PNG/JPEG screenshot containing a QR
+code.
+.TP
+.B add \fB-secret\fI S \fB-name\fI N " [" \fB-issuer\fI I ...]
+Add an account from its individual parts. The fields are
+.BR -secret " (required), " -name " (required), " -issuer ", " -type
+(totp, hotp or steam),
+.BR -algo " (SHA1, SHA256 or SHA512), " -digits " (6 or 8), " -period ", "
+.BR -counter " and " -notes .
+Steam codes are always five characters, so
+.B -digits
+is ignored for them.
+.TP
+.BI rm " query"
+Delete an account.
+.TP
+.BI pin " query"
+Pin or unpin an account so it sorts to the top.
+.TP
+.BR order " " issuer | used
+Order the list alphabetically or by most recently used.
+.TP
+.BI export " [query]"
+Print
+.I otpauth://
+URIs. These contain secrets.
+.TP
+.BI qr " query"
+Print a scannable QR code. It contains the secret.
+.TP
+.B migrate
+Print
+.I otpauth-migration://
+QR codes for every account, readable by Google Authenticator's import.
+.TP
+.BI backup " file"
+Write every account to a file as a URI list, mode 0600. The file contains
+secrets in plaintext.
+.TP
+.BI restore " file"
+Import a backup. Aegis, andOTP, 2FAS, KeePassXC CSV and URI lists are
+recognised automatically.
+.TP
+.BR encrypt ", " decrypt
+Add or remove the vault passphrase.
+.TP
+.BR keyring " " status | set | forget
+Manage a passphrase stored in the operating system keyring.
+.TP
+.BR offset " " \fIseconds\fR | auto | none
+Add a fixed offset to the clock when generating codes, for a device whose
+clock cannot be synchronised. This masks a wrong clock rather than fixing it.
+.TP
+.B skew
+Compare the system clock to network time over SNTP. This is the only command
+that uses the network.
+.TP
+.BR yubikey " " list | code | put | delete | rename
+Use and manage OATH credentials stored on a YubiKey. Requires a build with
+.BR -tags " pcsc,"
+which links libpcsclite; install it with
+.I scripts/install-deps.sh --build
+and build with
+.IR "make build-pcsc" .
+The
+.I tpduck-pcsc
+package provides such a build.
+.TP
+.B versions
+List the retained copies of the vault. One is kept before every write.
+.TP
+.BR undo " [" \fB-version\fI " n]"
+Replace the vault with a retained copy. The restore is itself undoable.
+.TP
+.BI tag " [query tags]"
+List the tags in use, or set a comma-separated list on an account.
+.TP
+.B profiles
+List the named vaults. Select one with
+.BR -p .
+.TP
+.BR agent " " run | status | stop | forget
+Cache the derived key in memory so a run of commands does not re-derive it or
+re-prompt. The lifetime is absolute, as with
+.BR ssh-agent " " -t .
+.TP
+.BR completion " " bash | zsh | fish
+Print a shell completion script.
+.TP
+.B version
+Print the version, with the commit when the build was made in a checkout.
+.TP
+.B help
+Print a summary of commands and flags.
+.SH FLAGS
+.TP
+.BI -config " path"
+Vault location.
+.TP
+.BI -idle-lock " duration"
+Lock the UI after this much inactivity. 0 disables. Default 5m.
+.TP
+.BI -clip-clear " duration"
+Clear a copied code from the clipboard after this long. 0 disables. Default 15s.
+.TP
+.B -keyring
+Read the vault passphrase from the OS keyring.
+.TP
+.BI -window " n"
+Periods either side of now to accept when verifying. Default 1.
+.TP
+.BI -batch " n"
+Accounts per migration QR code. Default 10.
+.TP
+.BI -ntp " host:port"
+Server for the clock check. Default pool.ntp.org:123.
+.TP
+.B -copy
+With
+.BR code ,
+copy to the clipboard instead of printing.
+.TP
+.B -json
+With
+.BR list ,
+produce machine-readable output.
+.TP
+.BI -p ", " -profile " name"
+Use a named profile instead of the default vault.
+.TP
+.B -agent
+Use a running agent to avoid re-deriving the key. On by default.
+.TP
+.BI -agent-ttl " duration"
+How long the agent keeps a key. Default 15m, counted from when it was cached.
+.TP
+.BI -reader " name"
+Substring of the smart-card reader to use for
+.B yubikey
+commands. Without it every reader is tried until one answers as an OATH applet.
+.TP
+.BI -version " n"
+With
+.BR undo ,
+which retained copy to restore. 1 is the most recent.
+.TP
+.BI -format " fmt"
+Backup and export format: uri, aegis or andotp.
+.TP
+.B -encrypt
+With
+.BR backup ,
+seal the file with its own passphrase.
+.TP
+.BI -tags " a,b"
+With
+.BR add ,
+tag the account; with
+.BR list ,
+filter by tag.
+.TP
+.B -touch
+With
+.BR "yubikey put" ,
+require a physical touch to use the credential.
+.TP
+.B -force
+Do not ask for confirmation. Applies to
+.BR rm ", " restore ", " undo " and " "yubikey delete" .
+.SH INTERACTIVE KEYS
+.TP
+.BR Up / Down
+Move between accounts.
+.B Enter
+copies the highlighted code.
+.TP
+.B /
+Search.
+.TP
+.BR A ", " E ", " D
+Add, edit, delete.
+.TP
+.BR I ", " X ", " M
+Import, export, migration export.
+.TP
+.BR C ", " V ", " R
+Copy, verify a code, reveal the secret.
+.TP
+.BR N ", " Y
+Advance and resynchronise an HOTP counter.
+.TP
+.BR F ", " O
+Pin an account, change the ordering.
+.TP
+.BR P ", " L ", " K
+Passphrase, lock now, clock check.
+.TP
+.BR ? ", " Q
+Help, quit.
+.SH ENVIRONMENT
+.TP
+.B TPDUCK_PASSPHRASE
+Passphrase for an encrypted vault, used instead of prompting. Convenient for
+scripts, but it exposes the passphrase to anything that can read the process
+environment.
+.TP
+.B XDG_CONFIG_HOME
+Determines the default vault location.
+.SH FILES
+.TP
+.I ~/.config/tpduck/accounts.json
+The vault.
+.TP
+.I ~/.config/tpduck/accounts.json.lock
+An advisory lock held while the vault is written.
+.TP
+.I ~/.config/tpduck/accounts.json.1 \.\.\. .5
+Retained copies of the previous vault, newest first. See
+.BR versions " and " undo .
+.TP
+.I ~/.config/tpduck/profiles/NAME.json
+A named profile's vault. Select one with
+.BR -p .
+.SH SECURITY
+A plaintext vault is readable by any process running as you; the UI says so
+until a passphrase is set. Locking discards the decrypted accounts and zeroes
+the derived key, but Go strings are immutable, so the secrets themselves cannot
+be reliably scrubbed from process memory.
+.PP
+.BR export ", " qr ", " migrate " and " backup
+all emit secrets.
+.SH EXIT STATUS
+0 on success, 1 on error, and 1 from
+.B verify
+when the code does not match or from
+.B skew
+when the clock is too far out.
+.SH SEE ALSO
+RFC 6238 (TOTP), RFC 4226 (HOTP), RFC 9106 (Argon2).

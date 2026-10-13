@@ -9,30 +9,43 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	"strings"
 	"time"
 )
 
+// normalizeBase32 strips the separators providers like to show secrets with
+// (spaces, tabs, dashes) and upper-cases the result. It deliberately does not
+// add "=" padding: decodeBase32 decodes without padding, so storing it would
+// only put noise in the vault file.
 func normalizeBase32(s string) string {
-	s = strings.ToUpper(strings.ReplaceAll(s, " ", ""))
-	if r := len(s) % 8; r != 0 {
-		s += strings.Repeat("=", 8-r)
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case ' ', '\t', '\n', '\r', '-', '_':
+			continue
+		case '=':
+			continue
+		}
+		if r >= 'a' && r <= 'z' {
+			r -= 'a' - 'A'
+		}
+		b.WriteRune(r)
 	}
-	return s
+	return b.String()
 }
 
 func decodeBase32(s string) ([]byte, error) {
-	s = strings.ToUpper(strings.ReplaceAll(s, " ", ""))
 	dec := base32.StdEncoding.WithPadding(base32.NoPadding)
-	return dec.DecodeString(strings.TrimRight(s, "="))
+	return dec.DecodeString(normalizeBase32(s))
 }
 
 func Hotp(secret []byte, counter uint64, algo Algo) (uint32, error) {
 	msg := make([]byte, 8)
 	binary.BigEndian.PutUint64(msg, counter)
 
-	var mac hashLike
+	var mac hash.Hash
 	switch algo {
 	case AlgoSHA1:
 		mac = hmac.New(sha1.New, secret)
@@ -56,18 +69,23 @@ func Hotp(secret []byte, counter uint64, algo Algo) (uint32, error) {
 	return p, nil
 }
 
-type hashLike interface {
-	Write([]byte) (int, error)
-	Sum([]byte) []byte
-}
-
 // Totp returns (code, secondsRemaining, error)
 func Totp(secretB32 string, algo Algo, period, digits int, t time.Time) (string, int, error) {
-	if period <= 0 {
-		period = 30
+	raw, remain, err := totpRaw(secretB32, algo, period, t)
+	if err != nil {
+		return "", 0, err
 	}
 	if digits != 6 && digits != 8 {
-		digits = 6
+		digits = DefaultDigits
+	}
+	return truncateCode(raw, digits), remain, nil
+}
+
+// totpRaw returns the 31-bit dynamic-truncation value and the seconds left in
+// the window, before it is rendered as digits or as Steam's alphabet.
+func totpRaw(secretB32 string, algo Algo, period int, t time.Time) (uint32, int, error) {
+	if period <= 0 {
+		period = DefaultPeriod
 	}
 	sec := t.Unix()
 	counter := uint64(sec / int64(period))
@@ -75,20 +93,42 @@ func Totp(secretB32 string, algo Algo, period, digits int, t time.Time) (string,
 
 	key, err := decodeBase32(secretB32)
 	if err != nil {
-		return "", 0, fmt.Errorf("secret decode: %w", err)
+		return 0, 0, fmt.Errorf("secret decode: %w", err)
 	}
-	code31, err := Hotp(key, counter, algo)
+	if len(key) == 0 {
+		return 0, 0, errEmptySecret
+	}
+	raw, err := Hotp(key, counter, algo)
 	if err != nil {
-		return "", 0, err
+		return 0, 0, err
 	}
-	mod := uint32(math.Pow10(digits))
-	code := code31 % mod
-	return fmt.Sprintf("%0*d", digits, code), remain, nil
+	return raw, remain, nil
 }
 
+// errEmptySecret is shared by the TOTP and HOTP paths.
+var errEmptySecret = errors.New("secret is empty")
+
+// truncateCode reduces the 31-bit dynamic-truncation value to the requested
+// number of decimal digits, zero-padded.
+func truncateCode(raw uint32, digits int) string {
+	if digits != 6 && digits != 8 {
+		digits = DefaultDigits
+	}
+	return fmt.Sprintf("%0*d", digits, raw%uint32(math.Pow10(digits)))
+}
+
+// ValidateSecret reports whether b32 decodes to a usable HMAC key. An empty
+// secret is rejected: HMAC accepts a zero-length key and would otherwise
+// produce plausible-looking codes that no server will ever accept.
 func ValidateSecret(b32 string) error {
-	_, err := decodeBase32(normalizeBase32(b32))
-	return err
+	key, err := decodeBase32(b32)
+	if err != nil {
+		return err
+	}
+	if len(key) == 0 {
+		return errEmptySecret
+	}
+	return nil
 }
 
 func NormalizeSecret(b32 string) string { return normalizeBase32(b32) }

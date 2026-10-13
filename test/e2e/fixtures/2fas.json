@@ -1,0 +1,2 @@
+{"schemaVersion":4,"services":[{"name":"TwoFas","secret":"JBSWY3DPEHPK3PXP",
+ "otp":{"account":"twofas-user","issuer":"TwoFas","digits":6,"period":30,"algorithm":"SHA1","tokenType":"TOTP"}}]}

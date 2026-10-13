@@ -1,0 +1,127 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal ./tests test)
+          if [ -n "$out" ]; then
+            echo "these files need gofmt:"; echo "$out"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: tests (race)
+        run: CGO_ENABLED=1 go test ./... -race -count=1
+
+      - name: go mod tidy is committed
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  cross:
+    name: cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The release binaries are pure Go; a cgo dependency creeping in would
+      # silently break every platform we cannot build here.
+      - name: build every target
+        run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  smartcard:
+    name: build with YubiKey support
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # libpcsclite-dev is what the cgo binding compiles against.
+      - name: install build dependencies
+        run: ./scripts/install-deps.sh --build
+      # This path needs cgo and cannot be built in the default job, so it is
+      # the only place the PC/SC transport is compiled at all.
+      - run: make build-pcsc
+      - run: CGO_ENABLED=1 go vet -tags pcsc ./...
+      - name: smart-card packages
+        run: make packages-pcsc
+      - name: check the dependency is declared
+        run: |
+          deb=$(ls dist/pcsc/*.deb)
+          dpkg-deb -I "$deb" | grep -q "Depends: libpcsclite1" \
+            || { echo "the smart-card package must depend on libpcsclite1"; exit 1; }
+          echo "ok: $deb depends on libpcsclite1"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-pcsc
+          path: dist/pcsc/*.deb
+          retention-days: 7
+
+  e2e:
+    name: end-to-end (container)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run the hermetic suite
+        run: make e2e
+
+  e2e-pcsc:
+    name: end-to-end (virtual YubiKey)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Runs a tpduck built with -tags pcsc against a virtual smart card, so
+      # the PC/SC transport is exercised and not merely compiled. Everything
+      # happens inside the container, which has no network.
+      - name: run the smart-card suite
+        run: make e2e-pcsc
+
+  packages:
+    name: deb and rpm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: make packages
+      - name: inspect what we built
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          for f in dist/*.deb; do echo "== $f"; dpkg-deb -I "$f"; dpkg-deb -c "$f"; done
+          for f in dist/*.rpm; do echo "== $f"; rpm -qpi "$f"; rpm -qpl "$f"; done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 7

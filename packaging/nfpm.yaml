@@ -1,0 +1,78 @@
+# nfpm configuration: one description of the package, built as both .deb and
+# .rpm. Rendered by scripts/package.sh, which substitutes the environment
+# variables below for each architecture.
+name: ${PKG_NAME}
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: utils
+priority: optional
+maintainer: nexusriot <noreply@users.noreply.github.com>
+description: |
+  Terminal TOTP/HOTP/Steam authenticator.
+  tpduck generates two-factor codes in the terminal, as an interactive UI or
+  from scripts. Its vault is encrypted at rest with Argon2id and
+  XChaCha20-Poly1305, locks itself when idle, keeps recoverable copies of
+  previous versions, and imports from and exports to Google Authenticator,
+  Aegis, andOTP, 2FAS, KeePassXC and password-manager JSON exports.
+vendor: nexusriot
+homepage: https://github.com/nexusriot/tpduck
+license: MIT
+
+contents:
+  - src: ${STAGE}/tpduck
+    dst: /usr/bin/tpduck
+    file_info:
+      mode: 0755
+  - src: ${STAGE}/tpduck.1
+    dst: /usr/share/man/man1/tpduck.1
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/completions/tpduck.bash
+    dst: /usr/share/bash-completion/completions/tpduck
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/completions/tpduck.zsh
+    dst: /usr/share/zsh/site-functions/_tpduck
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/completions/tpduck.fish
+    dst: /usr/share/fish/vendor_completions.d/tpduck.fish
+    file_info:
+      mode: 0644
+  - src: ${STAGE}/README.md
+    dst: /usr/share/doc/tpduck/README.md
+    file_info:
+      mode: 0644
+
+replaces:
+  - ${PKG_CONFLICTS}
+conflicts:
+  - ${PKG_CONFLICTS}
+provides:
+  - tpduck
+
+deb:
+  fields:
+    Bugs: https://github.com/nexusriot/tpduck/issues
+
+# The default package is a pure-Go binary with no shared-library dependencies
+# at all, so the clipboard helpers and pcscd are only suggestions. The
+# smart-card flavour links libpcsclite, so scripts/package.sh promotes that to
+# a hard dependency for it -- see PKG_DEPENDS below.
+depends:
+  - ${PKG_DEPENDS}
+
+overrides:
+  deb:
+    recommends:
+      - pcscd
+    suggests:
+      - wl-clipboard
+      - xclip
+  rpm:
+    recommends:
+      - pcsc-lite
+    suggests:
+      - wl-clipboard
+      - xclip

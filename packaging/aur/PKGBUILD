@@ -1,0 +1,35 @@
+# Maintainer: nexusriot <noreply@users.noreply.github.com>
+#
+# Template: scripts/manifests.sh fills in pkgver and the checksums from a built
+# release.
+pkgname=tpduck-bin
+_pkgname=tpduck
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Terminal TOTP, HOTP and Steam Guard authenticator with an encrypted vault"
+arch=('x86_64' 'aarch64')
+url="https://github.com/nexusriot/tpduck"
+license=('MIT')
+provides=('tpduck')
+conflicts=('tpduck')
+# tpduck works without these; they are only needed to copy codes to the
+# clipboard, and for YubiKey support.
+optdepends=(
+  'wl-clipboard: clipboard support on Wayland'
+  'xclip: clipboard support on X11'
+  'pcsclite: YubiKey OATH support'
+)
+source_x86_64=("$url/releases/download/v$pkgver/${_pkgname}_v${pkgver}_linux_amd64.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/${_pkgname}_v${pkgver}_linux_arm64.tar.gz")
+sha256sums_x86_64=('@SHA_LINUX_AMD64@')
+sha256sums_aarch64=('@SHA_LINUX_ARM64@')
+
+package() {
+  cd "${_pkgname}_v${pkgver}_linux_$( [ "$CARCH" = 'x86_64' ] && echo amd64 || echo arm64 )"
+  install -Dm0755 tpduck "$pkgdir/usr/bin/tpduck"
+  install -Dm0644 tpduck.1 "$pkgdir/usr/share/man/man1/tpduck.1"
+  install -Dm0644 completions/tpduck.bash "$pkgdir/usr/share/bash-completion/completions/tpduck"
+  install -Dm0644 completions/tpduck.zsh "$pkgdir/usr/share/zsh/site-functions/_tpduck"
+  install -Dm0644 completions/tpduck.fish "$pkgdir/usr/share/fish/vendor_completions.d/tpduck.fish"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/tpduck/README.md"
+}

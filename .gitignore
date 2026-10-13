@@ -1,0 +1,38 @@
+# --- build output ---
+/bin/
+/dist/
+# `go build ./cmd/tpduck` from the repo root leaves the binary here.
+/tpduck
+/tpduck-pcsc
+/vicc
+/mkqr
+# Packages or archives built outside dist/.
+/*.deb
+/*.rpm
+/*.tar.gz
+/*.zip
+
+# --- test and coverage output ---
+*.test
+*.out
+/coverage*
+
+# --- local vaults ---
+# In case anyone points -config at the checkout: the vault, its lock, and the
+# retained copies tpduck keeps before each write.
+accounts.json
+accounts.json.lock
+accounts.json.[1-9]
+*.vault
+
+# --- Go tooling ---
+go.work
+go.work.sum
+
+# --- editor and OS noise ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -13,23 +13,40 @@ func ParseOtpauthURI(raw string) (*Account, error) {
 	if err != nil {
 		return nil, err
 	}
-	if u.Scheme != "otpauth" || u.Host != "totp" {
-		return nil, fmt.Errorf("not an otpauth totp uri")
+	// Scheme and host are case-insensitive per RFC 3986; Go does not fold them.
+	if !strings.EqualFold(u.Scheme, "otpauth") {
+		return nil, fmt.Errorf("not an otpauth uri")
+	}
+	var kind OTPType
+	switch {
+	case strings.EqualFold(u.Host, string(TypeTOTP)):
+		kind = TypeTOTP
+	case strings.EqualFold(u.Host, string(TypeHOTP)):
+		kind = TypeHOTP
+	case strings.EqualFold(u.Host, string(TypeSteam)):
+		kind = TypeSteam
+	default:
+		return nil, fmt.Errorf("unsupported otpauth type %q (want totp, hotp or steam)", u.Host)
 	}
 
-	// label is "Issuer:AccountName" or just "AccountName"
+	// label is "Issuer:AccountName" or just "AccountName".
+	// u.Path is already percent-decoded by url.Parse; decoding it a second time
+	// would corrupt labels that legitimately contain a "%" sequence.
 	label := strings.TrimPrefix(u.Path, "/")
-	label, _ = url.PathUnescape(label)
 
 	q := u.Query()
-	qIssuer := q.Get("issuer")
+	qIssuer := strings.TrimSpace(q.Get("issuer"))
 	secret := q.Get("secret")
 	algoStr := strings.ToUpper(q.Get("algorithm"))
 	digitsStr := q.Get("digits")
 	periodStr := q.Get("period")
+	counterStr := q.Get("counter")
 
-	if secret == "" {
+	if strings.TrimSpace(secret) == "" {
 		return nil, fmt.Errorf("missing secret in otpauth")
+	}
+	if err := ValidateSecret(secret); err != nil {
+		return nil, fmt.Errorf("invalid secret: %w", err)
 	}
 
 	// Always split the label; many providers include both issuer in label and query.
@@ -43,9 +60,12 @@ func ParseOtpauthURI(raw string) (*Account, error) {
 	// Prefer query issuer, fall back to label issuer.
 	issuer := qIssuer
 	if issuer == "" {
-		issuer = labelIssuer
+		issuer = strings.TrimSpace(labelIssuer)
 	}
-	name := labelName
+	name := strings.TrimSpace(labelName)
+	if name == "" {
+		return nil, fmt.Errorf("missing account name in otpauth label")
+	}
 
 	// Algorithm, digits, period with sane defaults
 	algo := AlgoSHA1
@@ -60,18 +80,40 @@ func ParseOtpauthURI(raw string) (*Account, error) {
 		return nil, fmt.Errorf("unsupported algorithm: %s", algoStr)
 	}
 
-	digits := 6
-	if digitsStr != "" {
-		if v, err := strconv.Atoi(digitsStr); err == nil && (v == 6 || v == 8) {
-			digits = v
+	digits := DefaultDigits
+	if kind == TypeSteam {
+		// Steam codes are always five characters; a digits parameter on a
+		// steam URI is noise rather than a contradiction.
+		digits = SteamDigits
+	} else if digitsStr != "" {
+		v, err := strconv.Atoi(digitsStr)
+		if err != nil || (v != 6 && v != 8) {
+			return nil, fmt.Errorf("unsupported digits: %s", digitsStr)
 		}
+		digits = v
 	}
 
-	period := 30
+	period := DefaultPeriod
 	if periodStr != "" {
-		if v, err := strconv.Atoi(periodStr); err == nil && v > 0 {
-			period = v
+		v, err := strconv.Atoi(periodStr)
+		if err != nil || v < MinPeriod || v > MaxPeriod {
+			return nil, fmt.Errorf("unsupported period: %s", periodStr)
 		}
+		period = v
+	}
+
+	// HOTP is counter-based; the spec makes counter mandatory for it, and a
+	// wrong starting counter produces codes the server silently rejects.
+	var counter uint64
+	if kind == TypeHOTP {
+		if counterStr == "" {
+			return nil, fmt.Errorf("hotp uri is missing the required counter parameter")
+		}
+		v, err := strconv.ParseUint(counterStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid counter: %s", counterStr)
+		}
+		counter = v
 	}
 
 	acc := &Account{
@@ -81,6 +123,8 @@ func ParseOtpauthURI(raw string) (*Account, error) {
 		Digits:  digits,
 		Period:  period,
 		Algo:    algo,
+		Type:    kind,
+		Counter: counter,
 		AddedAt: time.Now().Unix(),
 	}
 	acc.ID = MakeID(*acc)

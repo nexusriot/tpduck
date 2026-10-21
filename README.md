@@ -10,9 +10,11 @@ A terminal authenticator for TOTP, HOTP and Steam Guard codes, written in Go.
 - Imports `otpauth://` URIs, Google Authenticator exports, Aegis, andOTP, 2FAS
   and KeePassXC backups, and QR codes out of a screenshot
 - Exports the same ways, including batched migration QR codes
-- Clipboard copies that clear themselves
+- Clipboard copies that clear themselves, and ask clipboard managers not to
+  record them
 - Verify a code, resynchronise an HOTP counter, check your clock
-- Stores credentials on a YubiKey, and reads them back
+- Stores credentials on a YubiKey, moves an account onto one, and can seal the
+  vault itself to a YubiKey so the file alone will not open
 - Named profiles, tags, and an agent that keeps the vault open briefly
 - Keeps the last few versions of the vault, so a deletion is recoverable
 - Works as a TUI or as a plain CLI for scripts
@@ -71,6 +73,7 @@ list.
 
 ```
 tpduck code <query>               print one code
+tpduck code -peek <query>         print it without consuming it
 tpduck verify <query> <code>      check a code a server showed you
 tpduck resync <query> <code>      realign an HOTP counter
 tpduck list [-json] [-tags a,b]   list accounts (never prints secrets)
@@ -87,10 +90,14 @@ tpduck tag [<query> <tags>]       list tags, or set them on an account
 tpduck profiles                   list named vaults (use with -p)
 tpduck agent run|status|stop|forget   cache the key for a few minutes
 tpduck encrypt | decrypt          add or remove the vault passphrase
+tpduck encrypt -yubikey           seal the vault to a YubiKey as well
 tpduck keyring status|set|forget  manage the stored passphrase
 tpduck offset <seconds|auto|none> compensate for an unsyncable clock
 tpduck skew                       compare the system clock to network time
 tpduck yubikey list|code|put|delete|rename    credentials on a YubiKey
+tpduck yubikey put <query>        move a vault account onto the key
+tpduck yubikey password set|remove   protect the key's own credentials
+tpduck yubikey reset              wipe every credential on the key
 tpduck completion bash|zsh|fish   print a shell completion script
 ```
 
@@ -101,7 +108,7 @@ Flags: `-config <path>`, `-p <profile>`, `-idle-lock <dur>` (default `5m`),
 `-clip-clear <dur>` (default `15s`), `-keyring`, `-agent`, `-agent-ttl <dur>`
 (default `15m`), `-format <fmt>`, `-encrypt`, `-tags a,b`, `-window <n>`,
 `-batch <n>`, `-version <n>`, `-ntp <host:port>`, `-reader <name>`, `-touch`,
-`-copy`, `-json`, `-force`. `tpduck add` without a URI also takes `-secret`,
+`-copy`, `-json`, `-force`, `-peek`, `-yubikey`, `-slot <1|2>`, `-move`. `tpduck add` without a URI also takes `-secret`,
 `-name`, `-issuer`, `-type`, `-algo`, `-digits`, `-period`, `-counter` and
 `-notes`; run `tpduck help` for the full list.
 
@@ -112,6 +119,11 @@ tenth of a second and a passphrase prompt. `tpduck agent run` keeps the derived
 key in memory for 15 minutes so a sequence of commands does not re-ask. The
 lifetime is absolute, as with `ssh-agent -t`; `tpduck agent forget` drops
 everything immediately.
+
+It listens on `$XDG_RUNTIME_DIR/tpduck-agent.sock`, mode 0600, or on a 0700
+directory of its own under the temporary directory when there is no runtime
+directory. `TPDUCK_AGENT_SOCK` overrides the location. Every command that opens
+the vault uses a running agent unless you pass `-agent=false`.
 
 ### Profiles and tags
 
@@ -126,15 +138,26 @@ an andOTP or 2FAS JSON backup, a KeePassXC CSV, a list of `otpauth://` URIs, or
 a Google Authenticator `otpauth-migration://` payload. Anything else that is
 JSON is scanned for `otpauth://` URIs and `totp` fields, which covers Bitwarden,
 1Password and most password-manager exports without a parser each. `tpduck add`
-additionally accepts a path to a PNG or JPEG screenshot and reads the QR code
-out of it.
+additionally accepts a path to a PNG, JPEG or GIF screenshot and reads the QR
+code out of it.
 
 `tpduck backup -format uri|aegis|andotp` writes the whole vault out, and
 `-encrypt` seals it with its own passphrase so it is safe to put in cloud
 storage.
 
 Going the other way, `tpduck migrate` prints batched migration QR codes that
-Google Authenticator's "Import accounts" reads directly.
+Google Authenticator's "Import accounts" reads directly. The migration format
+has no Steam Guard, so Steam accounts are left out and named rather than
+exported as a six-digit TOTP that would produce codes Steam rejects; use
+`tpduck qr` for those.
+
+### Reading a code without spending it
+
+`tpduck code -peek <query>` prints the code and changes nothing: it does not
+advance an HOTP counter, does not record the account as used, and does not
+write the vault at all. That matters most for HOTP, where an ordinary read
+burns a counter step you cannot get back, and it makes a polling script safe
+against a vault something else is also writing.
 
 ## Where things are stored
 
@@ -184,8 +207,39 @@ derived key. Note that Go strings are immutable, so the secrets themselves
 cannot be reliably scrubbed from memory; what locking guarantees is that the
 key material is gone and the plaintext is no longer referenced.
 
+Locking only means anything for an encrypted vault: there is no key to discard
+otherwise, and the accounts are readable on disk regardless, so `L` and
+`-idle-lock` do nothing until a passphrase is set.
+
 For scripts, `TPDUCK_PASSPHRASE` is read instead of prompting. It exposes the
-passphrase to anything that can read the process environment.
+passphrase to anything that can read the process environment. A YubiKey's own
+applet password is a separate secret and comes from `TPDUCK_YUBIKEY_PASSWORD`.
+
+The vault can also be sealed to a YubiKey, so that the file plus the passphrase
+is not enough on its own — see [YubiKey](#yubikey).
+
+## The clipboard
+
+A copied code is cleared after `-clip-clear` (15 seconds by default), and only
+if the clipboard still holds what tpduck put there — overwriting something you
+copied since would be worse than leaving a code behind.
+
+Clearing is not enough on its own: a clipboard history manager has already
+recorded the code by then, and keeps it long after tpduck has moved on. So the
+copy is also marked as sensitive where the backend can say so:
+
+| Backend | Marking |
+| --- | --- |
+| `wl-copy` (Wayland) | `--sensitive`, which becomes the `x-kde-passwordManagerHint` type that Klipper, cliphist and others look for. Needs wl-clipboard 2.3 or newer; older versions are detected and the copy goes through unmarked. |
+| PowerShell (Windows) | `ExcludeClipboardContentFromMonitorProcessing`, `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard`, which keep the code out of the Win+V history and out of cloud sync. |
+| `xclip`, `xsel` (X11) | None. An X11 selection owner advertises one target at a time, so the hint cannot accompany the text. |
+| `pbcopy` (macOS) | None. Setting `org.nspasteboard.ConcealedType` needs AppKit, and linking it would end the pure-Go cross-compile the release binaries depend on. |
+| `clip.exe` (Windows) | None; it is the fallback for a machine without PowerShell. |
+
+tpduck says which happened rather than letting you assume: the UI flashes
+"copied (marked sensitive)" when the marking took, and `tpduck code -copy`
+prints a note when it did not. Marking is a request, not a guarantee — a
+clipboard manager is free to ignore it.
 
 ## Networking
 
@@ -195,18 +249,90 @@ a timestamp request and no account data.
 
 ## Recovering from a mistake
 
-Before every write, the previous vault is kept as `accounts.json.1`, with five
-copies retained. `tpduck versions` lists them and `tpduck undo` puts one back —
-including after a deletion, which is otherwise unrecoverable. The restore is
-itself undoable.
+Whenever a write changes the vault's contents, the previous state is kept as
+`accounts.json.1`, with five copies retained. `tpduck versions` lists them and
+`tpduck undo` puts one back — including after a deletion, which is otherwise
+unrecoverable. The restore is itself undoable.
+
+"Changes the contents" means the accounts themselves: adding, editing or
+deleting one, or changing a secret, a tag, a note or the pinning. Taking a code
+also writes the vault, to record that the account was used and to advance an
+HOTP counter, but that does not rotate the copies — otherwise an afternoon's
+ordinary use would push the deletion you wanted to undo out of the history.
 
 ## YubiKey
 
 `tpduck yubikey list` and `code` read OATH credentials from a YubiKey, and
 `put`, `delete` and `rename` manage them, so a secret can live only on the key.
 Password-protected applets are unlocked with the key's own challenge-response.
-This needs a build with smart-card support, which uses cgo and links against
-libpcsclite:
+
+### Moving an account onto the key
+
+`tpduck yubikey put <query>` takes the secret from the vault instead of making
+you retype one it already holds. Nothing is removed until you ask:
+
+```
+tpduck yubikey put github           # copy it to the key, keep the vault's copy
+tpduck yubikey put github -move     # and then delete the vault's copy
+```
+
+Before `-move` deletes anything, tpduck asks the key for a code and checks it
+against the one it computes itself, so the credential is known to have landed
+correctly. Counter-based accounts are the exception: asking a HOTP credential
+for a code advances the key's counter, so they are not verified and `-move`
+needs `-force`.
+
+There is no way back. A credential on the key answers challenges but never
+gives its secret up — that is the point of putting it there — so `tpduck` can
+copy an account to the key and never from it. Steam Guard accounts cannot go on
+the key at all: the OATH applet has no such type.
+
+### The key's own password
+
+`tpduck yubikey password set` protects the credentials stored on the key, so
+somebody holding it cannot read codes off it. `remove` takes it off again, and
+`tpduck yubikey reset` wipes the applet completely — every credential and the
+password — which is the only way back into a key whose password was forgotten,
+and destroys the only copy of each secret on it.
+
+This password is a different secret from the vault passphrase and is read from
+`TPDUCK_YUBIKEY_PASSWORD`, not `TPDUCK_PASSPHRASE`, so a script that supplies
+one does not silently supply the other.
+
+### Sealing the vault to the key
+
+```
+tpduck encrypt -yubikey            # passphrase AND key
+tpduck encrypt -yubikey -slot 1    # using slot 1 instead of the default 2
+```
+
+The vault's key is then derived from the passphrase *and* an HMAC-SHA1
+challenge-response from the YubiKey, so copying the file somewhere else does
+not help: the slot's secret never leaves the key. Leave the passphrase empty
+and the key becomes the only factor, which opens the vault with nothing typed.
+
+The slot must already be programmed for challenge-response; tpduck deliberately
+cannot program one, because writing a slot is destructive and belongs to
+`ykman`:
+
+```
+ykman otp chalresp --touch 2       # --touch means the key must be touched
+```
+
+Opening a sealed vault needs no flag — the vault says it needs a key, and
+tpduck asks for one. The derived key caches in the agent like any other, so
+`tpduck agent run` means touching the key once rather than once per command.
+Changing the passphrase keeps the binding; `tpduck decrypt` is how you remove
+it.
+
+**If the key is lost, the vault is gone.** Keep a `tpduck backup -encrypt`
+somewhere safe before relying on this; a backup is sealed with its own
+passphrase and never with the key, exactly so it survives losing one.
+
+### Building with smart-card support
+
+All of the above needs a build with smart-card support, which uses cgo and
+links against libpcsclite:
 
 ```
 ./scripts/install-deps.sh --build    # libpcsclite-dev and a C toolchain
@@ -278,7 +404,9 @@ starts and exits on a pty.
 
 The smart-card suite is separate because it needs a different build. It runs a
 `-tags pcsc` binary against a *virtual* YubiKey: pcscd loads the vpcd driver,
-a `vicc` process serves the simulated OATH applet over it, and tpduck reaches
-it through the real libpcsclite. That is the only coverage the PC/SC transport
-has, since the release binaries do not contain it. It needs no hardware and no
-network.
+a `vicc` process serves the simulated OATH and OTP applets over it, and tpduck
+reaches it through the real libpcsclite. That is the only coverage the PC/SC
+transport has, since the release binaries do not contain it. It covers moving
+an account onto the key, the applet password and reset, and a vault sealed to
+the key — including that a different key, or no key, does not open it. It needs
+no hardware and no network.

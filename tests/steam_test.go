@@ -114,6 +114,33 @@ func TestSteamImportFromAegis(t *testing.T) {
 	}
 }
 
+// Steam Guard is time-based, so an export that leaves the period out wants the
+// same default every other time-based entry gets. Refusing it instead reported
+// a well-formed credential as an unrecognised backup.
+func TestSteamImportWithoutAPeriod(t *testing.T) {
+	const doc = `{"db":{"entries":[
+	 {"type":"steam","uuid":"s1","name":"player","issuer":"Steam",
+	  "info":{"secret":"JBSWY3DPEHPK3PXP"}}]}}`
+	accs, format, err := m.ParseBackup([]byte(doc))
+	if err != nil {
+		t.Fatalf("a Steam entry with no period was refused: %v", err)
+	}
+	if format != "Aegis" || len(accs) != 1 {
+		t.Fatalf("format=%q n=%d", format, len(accs))
+	}
+	if accs[0].Period != m.DefaultPeriod {
+		t.Errorf("period = %d, want the default %d", accs[0].Period, m.DefaultPeriod)
+	}
+	// And it produces the same code an explicit period=30 would.
+	got, err := m.Generate(accs[0], time.Unix(1234567890, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Value != "K8G5W" {
+		t.Errorf("produced %s, want K8G5W", got.Value)
+	}
+}
+
 // A steam account with a nonsense digit count must be normalised, not rejected.
 func TestSteamDigitsNormalised(t *testing.T) {
 	acc := m.Account{

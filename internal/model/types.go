@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -182,6 +183,14 @@ type vaultOrigin struct {
 	exists bool
 	size   int64
 	sum    [sha256.Size]byte
+
+	// material fingerprints the irreplaceable part of what the file held --
+	// which accounts exist and what their secrets are -- so a save that only
+	// records that a code was taken can be told apart from one that changed
+	// the vault's contents. materialKnown is false when the bytes were never
+	// decoded (a fingerprint taken with stampFile, say).
+	materialKnown bool
+	material      [sha256.Size]byte
 }
 
 // ErrVaultChanged is returned when the vault on disk no longer matches what
@@ -214,8 +223,48 @@ func stampBytes(path string, data []byte) vaultOrigin {
 	}
 }
 
+// matches compares what the file held, not what it meant: the material
+// fingerprint is about deciding whether to keep a copy, never about detecting
+// somebody else's write.
 func (o vaultOrigin) matches(other vaultOrigin) bool {
 	return o.exists == other.exists && o.size == other.size && o.sum == other.sum
+}
+
+// materialSum fingerprints everything in the store that a retained copy exists
+// to protect: which accounts there are, their secrets, and the parameters that
+// make a code come out right. Two stores that differ only in when a code was
+// last taken, where an HOTP counter has reached, or how the list is ordered
+// share a fingerprint -- none of that is recoverable only from a backup, and
+// rotating the retained copies for it would push the real history out within
+// an afternoon of ordinary use.
+func (s *Store) materialSum() [sha256.Size]byte {
+	lines := make([]string, 0, len(s.Accounts))
+	for _, a := range s.Accounts {
+		lines = append(lines, strings.Join([]string{
+			a.ID, a.Issuer, a.Name, NormalizeSecret(a.Secret),
+			string(a.Kind()), string(a.Algo),
+			strconv.Itoa(a.Digits), strconv.Itoa(a.Period),
+			a.Notes, strings.Join(a.Tags, "\x1f"), strconv.FormatBool(a.Pinned),
+		}, "\x1e"))
+	}
+	// Hash a canonical order, so merely re-sorting the list is not a change.
+	sort.Strings(lines)
+	h := sha256.New()
+	fmt.Fprintf(h, "tpduck-material/1\noffset=%d\n", s.TimeOffsetSeconds)
+	for _, l := range lines {
+		h.Write([]byte(l))
+		h.Write([]byte{'\n'})
+	}
+	var out [sha256.Size]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// noteMaterial records what this store's contents currently fingerprint as, so
+// the next save can tell whether anything worth keeping a copy of changed.
+func (s *Store) noteMaterial() {
+	s.origin.material = s.materialSum()
+	s.origin.materialKnown = true
 }
 
 // checkUnchanged reports whether path still holds what this store was read
@@ -471,12 +520,20 @@ func readVault(path string) ([]byte, vaultOrigin, error) {
 }
 
 func emptyStore(origin vaultOrigin) *Store {
-	return &Store{Accounts: []Account{}, origin: origin}
+	s := &Store{Accounts: []Account{}, origin: origin}
+	s.noteMaterial()
+	return s
 }
 
 // LoadStoreWithPass reads a vault, decrypting it if necessary. A passphrase
 // supplied for a plaintext vault is ignored.
 func LoadStoreWithPass(path, passphrase string) (*Store, error) {
+	return LoadStoreUnlocked(path, Pass(passphrase))
+}
+
+// LoadStoreUnlocked is LoadStoreWithPass for a vault that may also need a
+// hardware token.
+func LoadStoreUnlocked(path string, u Unlock) (*Store, error) {
 	data, origin, err := readVault(path)
 	if err != nil {
 		return nil, err
@@ -485,7 +542,10 @@ func LoadStoreWithPass(path, passphrase string) (*Store, error) {
 		return emptyStore(origin), nil
 	}
 	if IsEncrypted(data) {
-		plain, err := Decrypt(data, passphrase)
+		plain, k, err := OpenVault(data, u)
+		if k != nil {
+			k.Zero()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -506,6 +566,7 @@ func decodeStore(data []byte, origin vaultOrigin) (*Store, error) {
 		s.Accounts = []Account{}
 	}
 	s.origin = origin
+	s.noteMaterial()
 	return &s, nil
 }
 
@@ -583,15 +644,25 @@ func (s *Store) save(path string, k *Key, force bool) error {
 			return err
 		}
 	}
-	// Keep the previous state before replacing it. A failure here is not worth
-	// refusing the save over -- losing a backup copy beats losing the write.
-	_ = rotateVersions(path)
+	// Keep the previous state before replacing it -- but only when this save
+	// actually changes the vault. Taking a code rewrites the file to record
+	// that it was used, and rotating for that would spend the whole retained
+	// history on five code reads, exactly when somebody needs it to undo a
+	// deletion. A failure here is not worth refusing the save over: losing a
+	// backup copy beats losing the write.
+	material := s.materialSum()
+	unchanged := s.origin.known && s.origin.materialKnown &&
+		s.origin.path == path && s.origin.material == material
+	if !unchanged {
+		_ = rotateVersions(path)
+	}
 	if err := writeFileAtomic(path, data); err != nil {
 		return err
 	}
 	// This store now describes what is on disk, so the next save compares
 	// against what we just wrote.
 	s.origin = stampBytes(path, data)
+	s.origin.material, s.origin.materialKnown = material, true
 	return nil
 }
 
@@ -683,6 +754,12 @@ func MakeID(a Account) string {
 // so the caller can save again without paying the KDF cost a second time. The
 // key is nil for a plaintext vault.
 func OpenVaultFile(path, passphrase string) (*Store, *Key, error) {
+	return OpenVaultFileUnlocked(path, Pass(passphrase))
+}
+
+// OpenVaultFileUnlocked is OpenVaultFile for a vault that may also need a
+// hardware token.
+func OpenVaultFileUnlocked(path string, u Unlock) (*Store, *Key, error) {
 	data, origin, err := readVault(path)
 	if err != nil {
 		return nil, nil, err
@@ -694,7 +771,7 @@ func OpenVaultFile(path, passphrase string) (*Store, *Key, error) {
 		s, err := decodeStore(data, origin)
 		return s, nil, err
 	}
-	plain, key, err := Open(data, passphrase)
+	plain, key, err := OpenVault(data, u)
 	if err != nil {
 		return nil, nil, err
 	}

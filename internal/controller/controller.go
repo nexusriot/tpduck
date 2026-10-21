@@ -27,6 +27,10 @@ type Options struct {
 	// UseKeyring allows reading the passphrase from the OS secret store at
 	// startup. Writing to it is always an explicit choice by the user.
 	UseKeyring bool
+	// Hardware builds a responder for a vault sealed to a hardware token. It
+	// is nil in builds and tests with no smart-card support, which simply
+	// means such a vault cannot be opened here.
+	Hardware func(slot int) model.HardwareResponder
 }
 
 type Controller struct {
@@ -170,7 +174,8 @@ func (c *Controller) tryKeyringUnlock() bool {
 	if err != nil || pass == "" {
 		return false
 	}
-	store, key, err := model.OpenVaultFile(c.storePath, pass)
+	store, key, err := model.OpenVaultFileUnlocked(c.storePath,
+		model.Unlock{Passphrase: pass, Hardware: c.hardware()})
 	if err != nil {
 		// A stale entry (the passphrase was changed elsewhere) must not loop.
 		c.v.Flash("[yellow]keyring passphrase no longer opens this vault")
@@ -196,33 +201,94 @@ func (c *Controller) adoptStore(store *model.Store, key *model.Key) {
 	c.touch()
 }
 
+// hardware returns the responder for this vault, or nil when it does not need
+// one (or this build cannot reach a key).
+func (c *Controller) hardware() model.HardwareResponder {
+	hw := model.VaultHardware(c.storePath)
+	if !hw.Needed || c.opts.Hardware == nil {
+		return nil
+	}
+	return c.opts.Hardware(hw.Slot)
+}
+
 func (c *Controller) promptUnlock(title string) {
+	// A vault whose only factor is the token has nothing to ask for: go
+	// straight to the key.
+	if hw := model.VaultHardware(c.storePath); hw.Needed && hw.NoPassphrase {
+		c.unlockWith(title, model.Unlock{Hardware: c.hardware()})
+		return
+	}
 	c.promptUnlockHint(title, "passphrase for "+c.storePath)
 }
 
 func (c *Controller) promptUnlockHint(title, hint string) {
+	if hw := model.VaultHardware(c.storePath); hw.Needed {
+		hint += fmt.Sprintf(" (and its YubiKey, slot %d)", hw.Slot)
+	}
 	c.v.ShowPassphraseForm(title, hint, false, func(pass string) {
-		// Rate-limit guessing. The KDF already costs ~0.1s per attempt; this
-		// makes a sustained attempt against an unattended terminal pointless.
-		if d := c.unlockDelay(); d > 0 {
-			time.Sleep(d)
-		}
-		s, key, err := model.OpenVaultFile(c.storePath, pass)
-		if err != nil {
-			c.failedUnlocks++
-			// Rebuild the prompt rather than flashing in place: otherwise the
-			// rejected passphrase stays in the field and focus stays on the
-			// button, so the user has to clear it by hand before retrying.
-			hint := fmt.Sprintf("[red]%v[-] -- try again", err)
-			if d := c.unlockDelay(); d > 0 {
-				hint += fmt.Sprintf(" (waiting %s between attempts)", d)
-			}
-			c.promptUnlockHint(title, hint)
-			return
-		}
-		c.adoptStore(s, key)
-		c.v.Flash("[green]unlocked")
+		c.unlockWith(title, model.Unlock{Passphrase: pass, Hardware: c.hardware()})
 	}, nil) // no cancel: a locked vault has nothing to show
+}
+
+// unlockWith opens the vault off the event-loop goroutine. The key derivation
+// already costs ~100ms, and a touch-protected YubiKey can take seconds, so
+// doing it inline would freeze the screen with nothing on it explaining why.
+func (c *Controller) unlockWith(title string, u model.Unlock) {
+	needsKey := u.Hardware != nil
+	// The waiting dialog goes up for every unlock, not only the slow ones: it
+	// also takes the passphrase form off the screen, so the OK button cannot
+	// be pressed a second time while the first attempt is still running.
+	waiting := "deriving the key..."
+	if needsKey {
+		waiting = "asking the YubiKey -- touch it if it starts blinking"
+	}
+	c.v.ShowWaiting("Unlocking", waiting)
+	// Rate-limit guessing. The KDF already costs ~0.1s per attempt; this makes
+	// a sustained attempt against an unattended terminal pointless.
+	delay := c.unlockDelay()
+	path := c.storePath
+	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		s, key, err := model.OpenVaultFileUnlocked(path, u)
+		// A touch can take seconds, and the user may have quit in the
+		// meantime. Queueing an update on a stopped application blocks this
+		// goroutine for good once the queue fills.
+		select {
+		case <-c.done:
+			if key != nil {
+				key.Zero()
+			}
+			return
+		default:
+		}
+		c.v.App.QueueUpdateDraw(func() {
+			if err != nil {
+				c.failedUnlocks++
+				// Rebuild the prompt rather than flashing in place: otherwise
+				// the rejected passphrase stays in the field and focus stays
+				// on the button, so the user has to clear it by hand before
+				// retrying.
+				again := fmt.Sprintf("[red]%v[-] -- try again", err)
+				if d := c.unlockDelay(); d > 0 {
+					again += fmt.Sprintf(" (waiting %s between attempts)", d)
+				}
+				if needsKey && u.Passphrase == "" {
+					// Nothing was typed, so there is no form to put back up;
+					// offer a retry the user can trigger.
+					c.v.ConfirmOne("Unlock failed", again, "Try again", func() {
+						c.promptUnlock(title)
+					})
+					return
+				}
+				c.promptUnlockHint(title, again)
+				return
+			}
+			c.adoptStore(s, key)
+			c.v.Flash("[green]unlocked")
+		})
+	}()
 }
 
 // lock discards the decrypted accounts and the key. Everything is saved on
@@ -277,6 +343,20 @@ func (c *Controller) checkIdle() {
 	}
 }
 
+// newKeyFor derives a key for a new passphrase, keeping whatever hardware
+// binding the vault already has. Deriving a plain key here would quietly throw
+// the YubiKey factor away the next time somebody changed their passphrase.
+func (c *Controller) newKeyFor(pass string) (*model.Key, error) {
+	if hw := model.VaultHardware(c.storePath); hw.Needed {
+		r := c.hardware()
+		if r == nil {
+			return nil, fmt.Errorf("this vault is sealed to a YubiKey, which this build cannot reach")
+		}
+		return model.NewHardwareKey(model.Unlock{Passphrase: pass, Hardware: r}, hw.Slot)
+	}
+	return model.NewKey(pass)
+}
+
 func (c *Controller) onPassphrase() {
 	if c.key == nil {
 		c.v.ShowPassphraseForm("Encrypt vault", "choose a passphrase -- there is no recovery if you forget it", true,
@@ -285,7 +365,7 @@ func (c *Controller) onPassphrase() {
 					c.v.Flash("[red]passphrase is empty")
 					return
 				}
-				key, err := model.NewKey(pass)
+				key, err := c.newKeyFor(pass)
 				if err != nil {
 					c.v.Flash(fmt.Sprintf("[red]%v", err))
 					return
@@ -310,7 +390,7 @@ func (c *Controller) onPassphrase() {
 				c.confirmDecrypt()
 				return
 			}
-			key, err := model.NewKey(pass)
+			key, err := c.newKeyFor(pass)
 			if err != nil {
 				c.v.Flash(fmt.Sprintf("[red]%v", err))
 				return
@@ -491,10 +571,14 @@ func (c *Controller) onAdd() {
 		acc.ID = c.store.UniqueID(model.MakeID(acc), -1)
 		acc.AddedAt = time.Now().Unix()
 		c.store.Accounts = append(c.store.Accounts, acc)
-		c.save()
 		c.selected = acc.ID
-		c.refreshList()
+		// Close the form before saving, never after: a save that finds the
+		// vault changed underneath us puts its own dialog up, and restoring
+		// the root afterwards would take that dialog away before it could be
+		// read, losing both the choice and the write.
 		c.v.RestoreRoot()
+		c.save()
+		c.refreshList()
 	}, func() { c.v.RestoreRoot() })
 }
 
@@ -516,10 +600,10 @@ func (c *Controller) onEdit() {
 		}
 		updated.ID = c.store.UniqueID(model.MakeID(updated), i)
 		c.store.Accounts[i] = updated
-		c.save()
 		c.selected = updated.ID
+		c.v.RestoreRoot() // before the save; see onAdd
+		c.save()
 		c.refreshList()
-		c.v.RestoreRoot()
 	}, func() { c.v.RestoreRoot() })
 }
 
@@ -542,9 +626,9 @@ func (c *Controller) onDelete() {
 	}
 	c.v.ConfirmDelete(*acc, func() {
 		i := c.store.FindIndexByID(acc.ID)
-		if i >= 0 {
+		removed := i >= 0
+		if removed {
 			c.store.Accounts = append(c.store.Accounts[:i], c.store.Accounts[i+1:]...)
-			c.save()
 		}
 		c.selected = ""
 		if n := len(c.store.Accounts); n > 0 {
@@ -553,8 +637,11 @@ func (c *Controller) onDelete() {
 			}
 			c.selected = c.store.Accounts[i].ID
 		}
+		c.v.RestoreRoot() // before the save; see onAdd
+		if removed {
+			c.save()
+		}
 		c.refreshList()
-		c.v.RestoreRoot()
 	}, func() { c.v.RestoreRoot() })
 }
 
@@ -565,13 +652,15 @@ func (c *Controller) onImport() {
 			c.v.Flash(fmt.Sprintf("[red]%v", err))
 			return
 		}
-		c.save()
 		if len(added) > 0 {
 			c.selected = added[len(added)-1]
 		}
+		c.v.RestoreRoot() // before the save; see onAdd
+		saved := c.save()
 		c.refreshList()
-		c.v.RestoreRoot()
-		c.v.Flash(fmt.Sprintf("[green]imported %d account(s)", len(added)))
+		if saved {
+			c.v.Flash(fmt.Sprintf("[green]imported %d account(s)", len(added)))
+		}
 	}, func() { c.v.RestoreRoot() })
 }
 
@@ -705,9 +794,11 @@ func (c *Controller) onAdvance() {
 		c.v.Flash(fmt.Sprintf("[red]%v", err))
 		return
 	}
-	c.save()
+	saved := c.save()
 	c.refreshList()
-	c.v.Flash(fmt.Sprintf("[green]counter advanced to %d", c.current().Counter))
+	if saved {
+		c.v.Flash(fmt.Sprintf("[green]counter advanced to %d", c.current().Counter))
+	}
 }
 
 func (c *Controller) onPin() {
@@ -721,8 +812,11 @@ func (c *Controller) onPin() {
 		c.v.Flash(fmt.Sprintf("[red]%v", err))
 		return
 	}
-	c.save()
+	saved := c.save()
 	c.refreshList()
+	if !saved {
+		return
+	}
 	if pinned {
 		c.v.Flash("[green]pinned to the top")
 	} else {
@@ -736,9 +830,11 @@ func (c *Controller) onOrder() {
 	} else {
 		c.store.Order = model.SortByUsed
 	}
-	c.save()
+	saved := c.save()
 	c.refreshList()
-	c.v.Flash(fmt.Sprintf("[green]ordering by %s", c.store.Order))
+	if saved {
+		c.v.Flash(fmt.Sprintf("[green]ordering by %s", c.store.Order))
+	}
 }
 
 func (c *Controller) onResync() {
@@ -760,10 +856,12 @@ func (c *Controller) onResync() {
 				c.v.Flash(fmt.Sprintf("[red]%v", err))
 				return
 			}
-			c.save()
+			c.v.RestoreRoot() // before the save; see onAdd
+			saved := c.save()
 			c.refreshList()
-			c.v.RestoreRoot()
-			c.v.Flash(fmt.Sprintf("[green]counter resynced to %d", n))
+			if saved {
+				c.v.Flash(fmt.Sprintf("[green]counter resynced to %d", n))
+			}
 		}, func() { c.v.RestoreRoot() })
 }
 
@@ -799,15 +897,23 @@ func (c *Controller) onMigrate() {
 		c.v.Flash("[yellow]nothing to export")
 		return
 	}
-	uris, err := model.BuildMigrationURIs(c.store.Accounts, model.DefaultMigrationBatch)
+	uris, skipped, err := model.BuildMigrationURIs(c.store.Accounts, model.DefaultMigrationBatch)
 	if err != nil {
 		c.v.Flash(fmt.Sprintf("[red]%v", err))
 		return
 	}
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "%d account(s) in %d QR code(s).\n", len(c.store.Accounts), len(uris))
+	fmt.Fprintf(b, "%d account(s) in %d QR code(s).\n", len(c.store.Accounts)-len(skipped), len(uris))
 	fmt.Fprintf(b, "Scan each one with Google Authenticator's \"Import accounts\".\n")
 	fmt.Fprintf(b, "Every code below contains secrets.\n")
+	if len(skipped) > 0 {
+		labels := make([]string, 0, len(skipped))
+		for _, a := range skipped {
+			labels = append(labels, a.Label())
+		}
+		fmt.Fprintf(b, "\nLeft out (the migration format has no Steam Guard): %s\n"+
+			"Export those with X instead.\n", strings.Join(labels, ", "))
+	}
 	for i, u := range uris {
 		qr, err := model.QRBlocks(u)
 		if err != nil {
@@ -837,16 +943,24 @@ func (c *Controller) onCopy() {
 	if c.store.Order == model.SortByUsed {
 		c.refreshList()
 	}
-	if err := c.clip.Copy(code.Value, c.opts.ClipClear, func() {
+	res, err := c.clip.Copy(code.Value, c.opts.ClipClear, func() {
 		c.v.App.QueueUpdateDraw(func() { c.v.Flash("[gray]clipboard cleared") })
-	}); err != nil {
+	})
+	if err != nil {
 		c.v.Flash(fmt.Sprintf("[yellow]%s (no clipboard helper: %v)", code.Value, err))
 		return
 	}
-	if c.opts.ClipClear > 0 {
-		c.v.Flash(fmt.Sprintf("[green]copied -- clipboard clears in %s", c.opts.ClipClear))
-	} else {
-		c.v.Flash("[green]copied to clipboard")
+	what := "copied"
+	if res.Sensitive {
+		// Worth saying: it is the difference between a code a clipboard
+		// manager has already recorded and one it was asked to skip.
+		what = "copied (marked sensitive)"
+	}
+	switch {
+	case c.opts.ClipClear > 0:
+		c.v.Flash(fmt.Sprintf("[green]%s -- clipboard clears in %s", what, c.opts.ClipClear))
+	default:
+		c.v.Flash("[green]" + what + " to clipboard")
 	}
 }
 
@@ -882,7 +996,7 @@ func (c *Controller) ntpServer() string {
 func (c *Controller) shortestPeriod() int {
 	shortest := model.DefaultPeriod
 	for _, a := range c.store.Accounts {
-		if a.Kind() == model.TypeTOTP && a.Period > 0 && a.Period < shortest {
+		if a.Kind() != model.TypeHOTP && a.Period > 0 && a.Period < shortest {
 			shortest = a.Period
 		}
 	}

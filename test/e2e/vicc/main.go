@@ -36,6 +36,8 @@ func main() {
 	creds := flag.String("credentials", "", "credentials as name=secret[:digits[:algo]], comma separated")
 	password := flag.String("password", "", "protect the applet with this password")
 	touch := flag.String("touch", "", "comma-separated credential names that require a touch")
+	hmac1 := flag.String("hmac-slot1", "", "programme OTP slot 1 for HMAC-SHA1 challenge-response with this secret")
+	hmac2 := flag.String("hmac-slot2", "", "programme OTP slot 2 for HMAC-SHA1 challenge-response with this secret")
 	wait := flag.Duration("wait", 30*time.Second, "how long to keep retrying the connection")
 	flag.Parse()
 
@@ -45,6 +47,12 @@ func main() {
 		card.SetPassword(*password,
 			[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
 			[]byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88})
+	}
+
+	for slot, secret := range map[int]string{1: *hmac1, 2: *hmac2} {
+		if secret != "" {
+			card.SetHMACSlot(slot, []byte(secret), false)
+		}
 	}
 
 	conn, err := dialWithRetry(*addr, *wait)

@@ -8,7 +8,6 @@
 package yubikey
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -24,24 +23,53 @@ type pcscTransport struct {
 // a substring of the reader name; empty means the first reader that answers as
 // an OATH applet.
 func Connect(reader string) (*Session, error) {
+	var out *Session
+	err := connectApplet(reader, "OATH", func(t Transport) error {
+		s, err := Open(t)
+		out = s
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ConnectOTP finds a connected YubiKey and opens its OTP applet, which is the
+// one that answers HMAC-SHA1 challenge-response.
+func ConnectOTP(reader string) (*OTPSession, error) {
+	var out *OTPSession
+	err := connectApplet(reader, "OTP", func(t Transport) error {
+		s, err := OpenOTP(t)
+		out = s
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// connectApplet walks the candidate readers and hands each one's transport to
+// open, stopping at the first that answers. A machine can easily have a
+// built-in reader alongside the key, and only one of them holds the applet, so
+// refusing to choose would make tpduck unusable on exactly those machines.
+func connectApplet(reader, applet string, open func(Transport) error) error {
 	ctx, err := scard.EstablishContext()
 	if err != nil {
-		return nil, fmt.Errorf("pcsc: %w (is pcscd running?)", err)
+		return fmt.Errorf("pcsc: %w (is pcscd running?)", err)
 	}
 	readers, err := ctx.ListReaders()
 	if err != nil {
 		ctx.Release()
-		return nil, fmt.Errorf("pcsc: list readers: %w", err)
+		return fmt.Errorf("pcsc: list readers: %w", err)
 	}
 	candidates, err := pickReaders(readers, reader)
 	if err != nil {
 		ctx.Release()
-		return nil, err
+		return err
 	}
 
-	// Try each candidate in turn. A machine can easily have a built-in reader
-	// alongside the key, and only one of them answers as an OATH applet, so
-	// refusing to choose would make tpduck unusable on exactly those machines.
 	var lastErr error
 	for _, name := range candidates {
 		card, err := ctx.Connect(name, scard.ShareShared, scard.ProtocolAny)
@@ -49,19 +77,20 @@ func Connect(reader string) (*Session, error) {
 			lastErr = fmt.Errorf("pcsc: connect to %q: %w", name, err)
 			continue
 		}
-		s, err := Open(&pcscTransport{ctx: ctx, card: card})
-		if err == nil {
-			return s, nil
+		t := &pcscTransport{ctx: ctx, card: card}
+		if err := open(t); err == nil {
+			return nil
+		} else {
+			lastErr = fmt.Errorf("%s: %w", name, err)
 		}
-		lastErr = fmt.Errorf("%s: %w", name, err)
 		_ = card.Disconnect(scard.LeaveCard)
 	}
 	ctx.Release()
 	if lastErr == nil {
-		lastErr = errors.New("no reader held a card with an OATH applet")
+		lastErr = fmt.Errorf("no reader held a card with a %s applet", applet)
 	}
-	return nil, fmt.Errorf("pcsc: no OATH applet on any reader (%s): %w",
-		strings.Join(candidates, ", "), lastErr)
+	return fmt.Errorf("pcsc: no %s applet on any reader (%s): %w",
+		applet, strings.Join(candidates, ", "), lastErr)
 }
 
 // pickReaders returns the readers to try, most likely first.

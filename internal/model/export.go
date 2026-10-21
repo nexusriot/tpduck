@@ -29,13 +29,24 @@ func (a Account) URI() string {
 		q.Set("issuer", a.Issuer)
 	}
 	q.Set("algorithm", string(a.Algo))
-	q.Set("digits", fmt.Sprintf("%d", a.Digits))
+	digits := a.Digits
+	if digits == 0 {
+		digits = DefaultDigits
+	}
+	q.Set("digits", fmt.Sprintf("%d", digits))
 	switch a.Kind() {
 	case TypeHOTP:
 		q.Set("counter", fmt.Sprintf("%d", a.Counter))
 	default:
 		// Steam uses the otpauth://steam/ host, so the period still applies.
-		q.Set("period", fmt.Sprintf("%d", a.Period))
+		// A zero period would render as "period=0", which every reader --
+		// including this one -- rejects, so fall back to the default rather
+		// than emitting a URI that cannot be imported anywhere.
+		period := a.Period
+		if period <= 0 {
+			period = DefaultPeriod
+		}
+		q.Set("period", fmt.Sprintf("%d", period))
 	}
 	u := url.URL{
 		Scheme:   "otpauth",

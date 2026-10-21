@@ -29,7 +29,10 @@ than guessed.
 .TP
 .BI code " query"
 Print the current code. For a counter-based (HOTP) account this also advances
-the counter, because such codes are single-use.
+the counter, because such codes are single-use. With
+.BR -peek
+it changes nothing at all: the counter stays put, the use is not recorded, and
+the vault is not written.
 .TP
 .BI verify " query code"
 Report whether a code is one this account currently produces. Exits non-zero
@@ -45,8 +48,8 @@ List accounts. Never prints secrets.
 .BI add " uri|file|image.png"
 Import an
 .IR otpauth:// " URI, an " otpauth-migration:// " export,"
-a backup from another authenticator, or a PNG/JPEG screenshot containing a QR
-code.
+a backup from another authenticator, or a PNG, JPEG or GIF screenshot
+containing a QR code.
 .TP
 .B add \fB-secret\fI S \fB-name\fI N " [" \fB-issuer\fI I ...]
 Add an account from its individual parts. The fields are
@@ -78,18 +81,33 @@ Print a scannable QR code. It contains the secret.
 .B migrate
 Print
 .I otpauth-migration://
-QR codes for every account, readable by Google Authenticator's import.
+QR codes for every account, readable by Google Authenticator's import. The
+format has no Steam Guard, so Steam accounts are named on stderr and left out
+rather than exported as a six-digit code Steam would reject; use
+.B qr
+for those.
 .TP
 .BI backup " file"
-Write every account to a file as a URI list, mode 0600. The file contains
-secrets in plaintext.
+Write every account to a file, mode 0600 even if the file already existed with
+something laxer. The format follows
+.BR -format " (" uri ", the default, or " aegis " or " andotp ");"
+.B -encrypt
+seals the result with its own passphrase. Without it the file contains secrets
+in plaintext.
 .TP
 .BI restore " file"
 Import a backup. Aegis, andOTP, 2FAS, KeePassXC CSV and URI lists are
 recognised automatically.
 .TP
 .BR encrypt ", " decrypt
-Add or remove the vault passphrase.
+Add or remove the vault passphrase. With
+.B -yubikey
+the vault is sealed to a YubiKey as well, so the file and the passphrase alone
+will not open it; see
+.B SEALING THE VAULT TO A YUBIKEY
+below.
+.B decrypt
+removes both.
 .TP
 .BR keyring " " status | set | forget
 Manage a passphrase stored in the operating system keyring.
@@ -102,8 +120,28 @@ clock cannot be synchronised. This masks a wrong clock rather than fixing it.
 Compare the system clock to network time over SNTP. This is the only command
 that uses the network.
 .TP
-.BR yubikey " " list | code | put | delete | rename
-Use and manage OATH credentials stored on a YubiKey. Requires a build with
+.BR yubikey " " list | code | put | delete | rename | password | reset
+Use and manage OATH credentials stored on a YubiKey.
+.B put
+with a query takes the secret from the vault rather than from
+.BR -secret ;
+with
+.B -move
+it then deletes the vault's copy, but only after the key has reproduced a code
+tpduck computed itself. A counter-based credential cannot be checked that way,
+because asking it for a code advances the key's counter, so
+.B -move
+needs
+.B -force
+for one. Nothing can be copied back off a key: a credential there answers
+challenges and never gives up its secret.
+.B password
+.RB ( set " or " remove )
+protects the credentials on the key itself, and
+.B reset
+wipes the applet \- every credential and the password \- which cannot be undone
+and destroys the only copy of each secret on it.
+Requires a build with
 .BR -tags " pcsc,"
 which links libpcsclite; install it with
 .I scripts/install-deps.sh --build
@@ -114,7 +152,11 @@ The
 package provides such a build.
 .TP
 .B versions
-List the retained copies of the vault. One is kept before every write.
+List the retained copies of the vault. One is kept before every write that
+changes the accounts \- adding, editing or deleting one, or changing a secret,
+tag, note or pin. Taking a code also writes the vault, to record the use and
+advance an HOTP counter, but does not rotate the copies, so ordinary use cannot
+push an accidental deletion out of the history.
 .TP
 .BR undo " [" \fB-version\fI " n]"
 Replace the vault with a retained copy. The restore is itself undoable.
@@ -145,7 +187,9 @@ Print a summary of commands and flags.
 Vault location.
 .TP
 .BI -idle-lock " duration"
-Lock the UI after this much inactivity. 0 disables. Default 5m.
+Lock the UI after this much inactivity. 0 disables. Default 5m. It applies only
+to an encrypted vault: a plaintext one has no key to discard and is readable on
+disk anyway.
 .TP
 .BI -clip-clear " duration"
 Clear a copied code from the clipboard after this long. 0 disables. Default 15s.
@@ -176,7 +220,10 @@ produce machine-readable output.
 Use a named profile instead of the default vault.
 .TP
 .B -agent
-Use a running agent to avoid re-deriving the key. On by default.
+Use a running agent to avoid re-deriving the key, for every command that opens
+the vault. On by default; pass
+.B -agent=false
+to ignore one.
 .TP
 .BI -agent-ttl " duration"
 How long the agent keeps a key. Default 15m, counted from when it was cached.
@@ -211,9 +258,32 @@ With
 .BR "yubikey put" ,
 require a physical touch to use the credential.
 .TP
+.B -peek
+With
+.BR code ,
+read the code without consuming it: no counter is advanced, no use is recorded,
+and the vault is not written.
+.TP
+.B -yubikey
+With
+.BR encrypt ,
+seal the vault to a YubiKey's challenge-response slot as well as to the
+passphrase.
+.TP
+.BI -slot " 1|2"
+Which YubiKey challenge-response slot to use. Default 2, because slot 1 usually
+still holds the factory Yubico OTP credential.
+.TP
+.B -move
+With
+.BR "yubikey put" ,
+remove the vault's copy once the key has been shown to hold the credential.
+.TP
 .B -force
 Do not ask for confirmation. Applies to
-.BR rm ", " restore ", " undo " and " "yubikey delete" .
+.BR rm ", " restore ", " undo ", " "yubikey delete" ", " "yubikey reset"
+and an unverifiable
+.BR "yubikey put -move" .
 .SH INTERACTIVE KEYS
 .TP
 .BR Up / Down
@@ -240,7 +310,7 @@ Advance and resynchronise an HOTP counter.
 Pin an account, change the ordering.
 .TP
 .BR P ", " L ", " K
-Passphrase, lock now, clock check.
+Passphrase, lock now (encrypted vaults only), clock check.
 .TP
 .BR ? ", " Q
 Help, quit.
@@ -251,8 +321,22 @@ Passphrase for an encrypted vault, used instead of prompting. Convenient for
 scripts, but it exposes the passphrase to anything that can read the process
 environment.
 .TP
+.B TPDUCK_YUBIKEY_PASSWORD
+Password for a YubiKey's own OATH applet. It is a different secret from the
+vault passphrase and has its own variable so that supplying one does not
+silently supply the other.
+.TP
 .B XDG_CONFIG_HOME
 Determines the default vault location.
+.TP
+.B XDG_RUNTIME_DIR
+Where
+.B agent run
+puts its socket.
+.TP
+.B TPDUCK_AGENT_SOCK
+Overrides the agent socket path entirely. A Unix socket path is limited to
+about 100 characters.
 .SH FILES
 .TP
 .I ~/.config/tpduck/accounts.json
@@ -268,6 +352,64 @@ Retained copies of the previous vault, newest first. See
 .I ~/.config/tpduck/profiles/NAME.json
 A named profile's vault. Select one with
 .BR -p .
+.TP
+.I $XDG_RUNTIME_DIR/tpduck-agent.sock
+The agent's socket, mode 0600. Without a runtime directory it goes in a 0700
+directory of its own under the temporary directory instead.
+.SH SEALING THE VAULT TO A YUBIKEY
+.B tpduck encrypt -yubikey
+derives the vault key from the passphrase
+.I and
+an HMAC-SHA1 challenge-response from the key, so a copy of the vault file is
+not enough to open it: the slot's secret never leaves the key. An empty
+passphrase makes the key the only factor, and the vault then opens with nothing
+typed.
+.PP
+The slot must already be programmed for challenge-response.
+.B tpduck
+deliberately cannot programme one, because writing a slot is destructive and
+belongs to
+.BR ykman :
+.PP
+.RS
+.B ykman otp chalresp --touch 2
+.RE
+.PP
+Opening a sealed vault needs no flag: the vault records that it wants a key and
+which slot answers, and tpduck asks for it. The derived key caches in the agent
+like any other, so
+.B tpduck agent run
+means touching the key once rather than once per command. Changing the
+passphrase keeps the binding;
+.B tpduck decrypt
+removes it.
+.PP
+If the key is lost the vault cannot be opened by anyone, including its owner.
+Keep a
+.B tpduck backup -encrypt
+somewhere safe first: a backup is sealed with its own passphrase and never with
+the key, so it survives losing one.
+.SH THE CLIPBOARD
+A copied code is cleared after
+.BR -clip-clear ,
+and only if the clipboard still holds what tpduck put there. Clearing alone is
+not enough, because a clipboard history manager has already recorded the code,
+so the copy is also marked as sensitive where the backend can say so:
+.B wl-copy
+passes
+.BR --sensitive ,
+which becomes the
+.I x-kde-passwordManagerHint
+type that Klipper and cliphist look for (wl-clipboard 2.3 or newer; older
+versions are detected and the copy goes through unmarked), and on Windows
+PowerShell sets the clipboard formats that keep a code out of the Win+V history
+and out of cloud sync.
+.PP
+.BR xclip ", " xsel " and " pbcopy
+cannot mark anything: an X11 selection owner advertises one target at a time,
+and macOS's concealed type needs AppKit, which would end the pure-Go
+cross-compile. tpduck reports which happened rather than letting you assume it
+worked.
 .SH SECURITY
 A plaintext vault is readable by any process running as you; the UI says so
 until a passphrase is set. Locking discards the decrypted accounts and zeroes
@@ -283,4 +425,6 @@ when the code does not match or from
 .B skew
 when the clock is too far out.
 .SH SEE ALSO
-RFC 6238 (TOTP), RFC 4226 (HOTP), RFC 9106 (Argon2).
+RFC 6238 (TOTP), RFC 4226 (HOTP), RFC 9106 (Argon2), RFC 2104 (HMAC).
+.BR ykman (1)
+programmes the challenge-response slot a sealed vault needs.

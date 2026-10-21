@@ -136,7 +136,9 @@ func TestParseBackupRejectsJunk(t *testing.T) {
 		"unknown json": `{"something":"else"}`,
 		"empty array":  `[]`,
 		"bad secret":   `[{"secret":"1111","label":"x","type":"TOTP","digits":6,"period":30}]`,
-		"steam entry":  `{"db":{"entries":[{"type":"steam","name":"x","info":{"secret":"JBSWY3DPEHPK3PXP"}}]}}`,
+		// A Steam entry missing its period is NOT junk -- see
+		// TestSteamImportWithoutAPeriod, which checks it is given the default
+		// the same way a nonsense digit count is normalised.
 	} {
 		if accs, format, err := m.ParseBackup([]byte(body)); err == nil {
 			t.Errorf("%s: accepted as %q -> %+v", name, format, accs)

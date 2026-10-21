@@ -232,7 +232,7 @@ func TestMigrationExportRoundTrip(t *testing.T) {
 		{Issuer: "Beta", Name: "bob", Secret: "JBSWY3DPEHPK3PXP", Digits: 8, Period: 30, Algo: m.AlgoSHA512},
 		{Issuer: "Ctr", Name: "carl", Secret: "JBSWY3DPEHPK3PXP", Digits: 6, Algo: m.AlgoSHA256, Type: m.TypeHOTP, Counter: 17},
 	}
-	uris, err := m.BuildMigrationURIs(want, 0)
+	uris, _, err := m.BuildMigrationURIs(want, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestMigrationExportBatches(t *testing.T) {
 	for i := range accs {
 		accs[i] = m.Account{Issuer: "I", Name: "n", Secret: "JBSWY3DPEHPK3PXP", Digits: 6, Period: 30, Algo: m.AlgoSHA1}
 	}
-	uris, err := m.BuildMigrationURIs(accs, 10)
+	uris, _, err := m.BuildMigrationURIs(accs, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestMigrationExportBatches(t *testing.T) {
 	if total != 25 {
 		t.Errorf("batches hold %d accounts, want 25", total)
 	}
-	if _, err := m.BuildMigrationURIs(nil, 0); err == nil {
+	if _, _, err := m.BuildMigrationURIs(nil, 0); err == nil {
 		t.Error("exporting nothing should be an error")
 	}
 }

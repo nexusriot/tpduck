@@ -135,13 +135,15 @@ rpm: dist
 install: build
 	install -Dm0755 $(BIN_DIR)/$(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
 	install -Dm0644 docs/$(BINARY).1 $(DESTDIR)$(PREFIX)/share/man/man1/$(BINARY).1
-	$(BIN_DIR)/$(BINARY) completion bash > /tmp/$(BINARY).bash
-	install -Dm0644 /tmp/$(BINARY).bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(BINARY)
-	$(BIN_DIR)/$(BINARY) completion zsh > /tmp/_$(BINARY)
-	install -Dm0644 /tmp/_$(BINARY) $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(BINARY)
-	$(BIN_DIR)/$(BINARY) completion fish > /tmp/$(BINARY).fish
-	install -Dm0644 /tmp/$(BINARY).fish $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(BINARY).fish
-	@rm -f /tmp/$(BINARY).bash /tmp/_$(BINARY) /tmp/$(BINARY).fish
+	@# Staged in the build directory, not /tmp: this target is usually run
+	@# under sudo, and a predictable /tmp path is a symlink waiting to happen.
+	$(BIN_DIR)/$(BINARY) completion bash > $(BIN_DIR)/$(BINARY).bash
+	install -Dm0644 $(BIN_DIR)/$(BINARY).bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(BINARY)
+	$(BIN_DIR)/$(BINARY) completion zsh > $(BIN_DIR)/_$(BINARY)
+	install -Dm0644 $(BIN_DIR)/_$(BINARY) $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(BINARY)
+	$(BIN_DIR)/$(BINARY) completion fish > $(BIN_DIR)/$(BINARY).fish
+	install -Dm0644 $(BIN_DIR)/$(BINARY).fish $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(BINARY).fish
+	@rm -f $(BIN_DIR)/$(BINARY).bash $(BIN_DIR)/_$(BINARY) $(BIN_DIR)/$(BINARY).fish
 	@echo "installed to $(DESTDIR)$(PREFIX)"
 
 ## uninstall    remove what install placed

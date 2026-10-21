@@ -1,6 +1,7 @@
 package yubikey
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -30,10 +31,28 @@ type SimCard struct {
 	// Challenge is what a locked applet offers for the response.
 	Challenge []byte
 
+	// HMACSlots holds the challenge-response secrets for OTP slots 1 and 2,
+	// indexed by slot number. An empty entry is an unprogrammed slot.
+	HMACSlots map[int][]byte
+	// HMACTouch marks slots that will not answer until the key is touched.
+	HMACTouch map[int]bool
+
+	// otpSelected is true once the OTP applet has been selected; the two
+	// applets share a card, and only one is current at a time.
+	otpSelected bool
+
+	// simAccess is the access key a client set with SET CODE. It stands in
+	// for Password, since that is all the applet ever actually holds.
+	simAccess []byte
+
 	validated bool
 	pending   []byte
 	closed    bool
 }
+
+// simPasswordSet marks the applet as protected by a key set over the wire
+// rather than by a password the test configured.
+const simPasswordSet = "\x00set-over-the-wire"
 
 // SimCredential is one credential held by the simulated applet.
 type SimCredential struct {
@@ -45,9 +64,35 @@ type SimCredential struct {
 	Touch  bool
 }
 
+// defaultDeviceID stands in for the identifier a real key reports when its
+// OATH applet is selected. It is always present on hardware, and the access
+// key for a password is salted with it, so a card without one cannot have a
+// password set at all.
+var defaultDeviceID = []byte{0x74, 0x70, 0x64, 0x75, 0x63, 0x6B, 0x73, 0x69}
+
 // NewSimCard builds a simulated applet holding the given credentials.
 func NewSimCard(creds ...SimCredential) *SimCard {
-	return &SimCard{creds: creds}
+	return &SimCard{
+		creds:     creds,
+		DeviceID:  append([]byte(nil), defaultDeviceID...),
+		HMACSlots: map[int][]byte{},
+		HMACTouch: map[int]bool{},
+	}
+}
+
+// SetHMACSlot programmes an OTP slot for HMAC-SHA1 challenge-response, the way
+// `ykman otp chalresp` would.
+func (f *SimCard) SetHMACSlot(slot int, secret []byte, touch bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HMACSlots == nil {
+		f.HMACSlots = map[int][]byte{}
+	}
+	if f.HMACTouch == nil {
+		f.HMACTouch = map[int]bool{}
+	}
+	f.HMACSlots[slot] = append([]byte(nil), secret...)
+	f.HMACTouch[slot] = touch
 }
 
 // SetPassword turns on password protection with a fixed device id and
@@ -58,6 +103,7 @@ func (f *SimCard) SetPassword(password string, deviceID, challenge []byte) {
 	f.Password = password
 	f.DeviceID = deviceID
 	f.Challenge = challenge
+	f.simAccess = nil
 }
 
 // Credentials returns a copy of what the card currently holds.
@@ -95,6 +141,7 @@ func (f *SimCard) Reset() {
 	defer f.mu.Unlock()
 	f.validated = false
 	f.pending = nil
+	f.otpSelected = false
 }
 
 // Transmit implements Transport: one C-APDU in, one R-APDU out.
@@ -122,6 +169,19 @@ func (f *SimCard) transmitLocked(apdu []byte) ([]byte, error) {
 		return f.drain(), nil
 	}
 	isSelect := ins == insSelect && apdu[2] == 0x04
+	// Selecting an applet switches which one the following APDUs reach.
+	if isSelect {
+		f.otpSelected = bytes.Equal(data, otpAID)
+		if f.otpSelected {
+			return f.respond(nil)
+		}
+	}
+	if f.otpSelected {
+		if ins == insAPIRequest {
+			return f.challengeResponse(apdu[2], data)
+		}
+		return statusWord(swWrongSyntax), nil
+	}
 	if f.Password != "" && !f.validated && !isSelect && ins != insValidate {
 		return statusWord(swAuthRequired), nil
 	}
@@ -159,8 +219,85 @@ func (f *SimCard) transmitLocked(apdu []byte) ([]byte, error) {
 		return f.remove(data)
 	case insRename:
 		return f.rename(data)
+	case insSetPwd:
+		return f.setPassword(data)
+	case insReset:
+		if apdu[2] != 0xDE || apdu[3] != 0xAD {
+			return statusWord(swWrongSyntax), nil
+		}
+		f.creds = nil
+		f.Password, f.Challenge, f.validated = "", nil, false
+		return f.respond(nil)
 	}
 	return statusWord(swWrongSyntax), nil
+}
+
+// challengeResponse answers the OTP applet's HMAC-SHA1 request.
+func (f *SimCard) challengeResponse(p1 byte, challenge []byte) ([]byte, error) {
+	slot := 0
+	switch p1 {
+	case p1ChalHMAC1:
+		slot = 1
+	case p1ChalHMAC2:
+		slot = 2
+	default:
+		return statusWord(swWrongSyntax), nil
+	}
+	secret := f.HMACSlots[slot]
+	if len(secret) == 0 {
+		return statusWord(swNoSuchObject), nil
+	}
+	if f.HMACTouch[slot] {
+		// A real key waits for the touch; the simulator cannot be touched, so
+		// it reports the timeout a key would report if nobody did.
+		return statusWord(swTouchTimeout), nil
+	}
+	mac := hmac.New(sha1.New, secret)
+	mac.Write(challenge)
+	return f.respond(mac.Sum(nil))
+}
+
+// setPassword stores a new access key, or clears it when the key TLV is empty.
+func (f *SimCard) setPassword(data []byte) ([]byte, error) {
+	var keyBlob, challenge, response []byte
+	sawKey := false
+	for _, t := range parseTLVs(data) {
+		switch t.tag {
+		case tagKey:
+			keyBlob, sawKey = t.value, true
+		case tagChallenge:
+			challenge = t.value
+		case tagResponse:
+			response = t.value
+		}
+	}
+	if !sawKey {
+		return statusWord(swWrongSyntax), nil
+	}
+	if len(keyBlob) == 0 {
+		f.Password, f.Challenge, f.simAccess = "", nil, nil
+		return f.respond(nil)
+	}
+	if len(keyBlob) < 2 || keyBlob[0] != accessKeyAlgo {
+		return statusWord(swWrongSyntax), nil
+	}
+	access := keyBlob[1:]
+	// The applet checks that the caller can really compute responses under
+	// the key it is being handed.
+	mac := hmac.New(sha1.New, access)
+	mac.Write(challenge)
+	if !hmac.Equal(response, mac.Sum(nil)) {
+		return statusWord(swWrongSignature), nil
+	}
+	f.simAccess = append([]byte(nil), access...)
+	// A password is now set. The simulator keeps the access key directly
+	// rather than a password, since that is all the applet ever sees.
+	f.Password = simPasswordSet
+	if len(f.Challenge) == 0 {
+		f.Challenge = []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}
+	}
+	f.validated = true
+	return f.respond(nil)
 }
 
 func (f *SimCard) find(name string) (SimCredential, bool) {
@@ -237,7 +374,10 @@ func (f *SimCard) validate(data []byte) ([]byte, error) {
 			theirChallenge = t.value
 		}
 	}
-	access := deriveAccessKey(f.Password, f.DeviceID)
+	access := f.simAccess
+	if access == nil {
+		access = deriveAccessKey(f.Password, f.DeviceID)
+	}
 	mac := hmac.New(sha1.New, access)
 	mac.Write(f.Challenge)
 	if !hmac.Equal(gotResponse, mac.Sum(nil)) {

@@ -65,7 +65,10 @@ func finish(a Account) (Account, error) {
 	if a.Digits == 0 {
 		a.Digits = DefaultDigits
 	}
-	if a.Period == 0 && a.Kind() == TypeTOTP {
+	// Steam Guard is time-based too, so it needs a period just as much as
+	// TOTP does; only counter-based codes have no use for one. Leaving it at
+	// zero made Validate reject every Steam entry whose export omitted it.
+	if a.Period == 0 && a.Kind() != TypeHOTP {
 		a.Period = DefaultPeriod
 	}
 	if a.Algo == "" {

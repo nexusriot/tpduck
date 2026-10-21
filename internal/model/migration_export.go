@@ -13,17 +13,34 @@ import (
 const DefaultMigrationBatch = 10
 
 // BuildMigrationURIs encodes accounts as one or more otpauth-migration:// URIs,
-// the format Google Authenticator's own export produces and reads. Returns one
-// URI per batch, in order.
-func BuildMigrationURIs(accounts []Account, perBatch int) ([]string, error) {
+// the format Google Authenticator's own export produces and reads. It returns
+// one URI per batch, in order, along with the accounts it could not represent.
+//
+// Steam Guard is the only such account: the migration protobuf has no code for
+// it, so an exported Steam credential would come back as a six-digit TOTP that
+// quietly produces codes Steam never accepts. Skipping it and saying so is the
+// only honest answer -- use `tpduck export` or `qr` for those.
+func BuildMigrationURIs(accounts []Account, perBatch int) (uris []string, skipped []Account, err error) {
+	exportable := make([]Account, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Kind() == TypeSteam {
+			skipped = append(skipped, a)
+			continue
+		}
+		exportable = append(exportable, a)
+	}
+	accounts = exportable
 	if len(accounts) == 0 {
-		return nil, fmt.Errorf("nothing to export")
+		if len(skipped) > 0 {
+			return nil, skipped, fmt.Errorf("the migration format cannot carry Steam Guard accounts; nothing else to export")
+		}
+		return nil, nil, fmt.Errorf("nothing to export")
 	}
 	if perBatch <= 0 {
 		perBatch = DefaultMigrationBatch
 	}
 	batches := (len(accounts) + perBatch - 1) / perBatch
-	uris := make([]string, 0, batches)
+	uris = make([]string, 0, batches)
 	for b := 0; b < batches; b++ {
 		end := (b + 1) * perBatch
 		if end > len(accounts) {
@@ -31,7 +48,7 @@ func BuildMigrationURIs(accounts []Account, perBatch int) ([]string, error) {
 		}
 		payload, err := encodeMigrationPayload(accounts[b*perBatch:end], batches, b)
 		if err != nil {
-			return nil, err
+			return nil, skipped, err
 		}
 		q := url.Values{}
 		q.Set("data", base64.StdEncoding.EncodeToString(payload))
@@ -41,7 +58,7 @@ func BuildMigrationURIs(accounts []Account, perBatch int) ([]string, error) {
 			RawQuery: q.Encode(),
 		}).String())
 	}
-	return uris, nil
+	return uris, skipped, nil
 }
 
 func encodeMigrationPayload(accounts []Account, batchSize, batchIndex int) ([]byte, error) {

@@ -14,6 +14,7 @@ import (
 	"github.com/nexusriot/tpduck/internal/controller"
 	"github.com/nexusriot/tpduck/internal/keyring"
 	"github.com/nexusriot/tpduck/internal/model"
+	"github.com/nexusriot/tpduck/internal/yubikey"
 )
 
 // saveVault wraps a store write so a concurrent modification is reported as
@@ -24,6 +25,24 @@ func saveVault(store *model.Store, path string, key *model.Key) error {
 		return fmt.Errorf("%w\n       nothing was written. Another tpduck or a sync tool changed the vault;\n       re-run this command to work from the current version", err)
 	}
 	return err
+}
+
+// writeSecretFile writes a file that holds credentials, forcing mode 0600 even
+// when it already existed with something laxer.
+func writeSecretFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func writeJSON(v any) error {
@@ -65,26 +84,35 @@ func cmdCode(f *flags, path string, args []string) error {
 	if err != nil {
 		return err
 	}
-	// HOTP codes are single-use, so printing one without advancing the counter
-	// would hand out the same code forever.
-	dirty := false
-	if acc.Kind() == model.TypeHOTP {
-		if err := store.AdvanceHOTP(acc.ID); err != nil {
-			return err
+	// -peek is a pure read: it looks at the code without consuming it. That
+	// matters most for HOTP, where printing one normally burns a counter step
+	// and you cannot get the same code back, but it also means a script that
+	// polls for codes never writes to the vault at all.
+	if !f.peek {
+		// HOTP codes are single-use, so printing one without advancing the
+		// counter would hand out the same code forever.
+		if acc.Kind() == model.TypeHOTP {
+			if err := store.AdvanceHOTP(acc.ID); err != nil {
+				return err
+			}
 		}
-		dirty = true
-	}
-	store.MarkUsed(acc.ID)
-	dirty = true
-	if dirty {
+		// Recording the use is what makes `tpduck order used` mean anything.
+		// It does not rotate the retained copies -- see Store.save.
+		store.MarkUsed(acc.ID)
 		if err := saveVault(store, path, key); err != nil {
 			return fmt.Errorf("save: %w", err)
 		}
 	}
 	if f.copyCode {
 		var t clipboard.Transient
-		if err := t.Copy(code.Value, f.clipClear, nil); err != nil {
+		res, err := t.Copy(code.Value, f.clipClear, nil)
+		if err != nil {
 			return err
+		}
+		if res.Sensitive {
+			fmt.Fprintf(os.Stderr, "copied via %s, marked so clipboard managers skip it\n", res.Helper)
+		} else if res.Note != "" {
+			fmt.Fprintln(os.Stderr, "note:", res.Note)
 		}
 		if f.clipClear > 0 {
 			// The clear is scheduled in this process, so it has to outlive the
@@ -332,11 +360,11 @@ func cmdRemove(f *flags, path string, args []string) error {
 	return nil
 }
 
-func cmdPin(path string, args []string) error {
+func cmdPin(f *flags, path string, args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: tpduck pin <query>")
 	}
-	store, key, err := openVault(nil, path)
+	store, key, err := openVault(f, path)
 	if err != nil {
 		return err
 	}
@@ -360,8 +388,8 @@ func cmdPin(path string, args []string) error {
 	return nil
 }
 
-func cmdOrder(path string, args []string) error {
-	store, key, err := openVault(nil, path)
+func cmdOrder(f *flags, path string, args []string) error {
+	store, key, err := openVault(f, path)
 	if err != nil {
 		return err
 	}
@@ -421,11 +449,11 @@ func cmdExport(f *flags, path string, args []string) error {
 	return nil
 }
 
-func cmdQR(path string, args []string) error {
+func cmdQR(f *flags, path string, args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: tpduck qr <query>")
 	}
-	store, key, err := openVault(nil, path)
+	store, key, err := openVault(f, path)
 	if err != nil {
 		return err
 	}
@@ -450,11 +478,15 @@ func cmdMigrate(f *flags, path string) error {
 	}
 	defer key.Zero()
 	store.Sort()
-	uris, err := model.BuildMigrationURIs(store.Accounts, f.batch)
+	uris, skipped, err := model.BuildMigrationURIs(store.Accounts, f.batch)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "%d account(s) in %d QR code(s); each contains secrets\n", len(store.Accounts), len(uris))
+	for _, a := range skipped {
+		fmt.Fprintf(os.Stderr, "skipping %s: the migration format has no Steam Guard; use `tpduck qr` for it\n", a.Label())
+	}
+	fmt.Fprintf(os.Stderr, "%d account(s) in %d QR code(s); each contains secrets\n",
+		len(store.Accounts)-len(skipped), len(uris))
 	for i, u := range uris {
 		fmt.Fprintf(os.Stderr, "\n--- batch %d of %d ---\n", i+1, len(uris))
 		out, err := model.QRANSI(u)
@@ -506,8 +538,11 @@ func cmdBackup(f *flags, path string, args []string) error {
 		}
 		note = "encrypted; there is no recovery if you forget the passphrase"
 	}
-	// 0600 regardless: an unencrypted backup holds every secret.
-	if err := os.WriteFile(args[0], data, 0o600); err != nil {
+	// 0600 regardless: an unencrypted backup holds every secret. WriteFile
+	// only applies the mode when it creates the file, so writing over an
+	// existing one would leave whatever permissions that already had --
+	// world-readable, if it came from a shell redirect.
+	if err := writeSecretFile(args[0], data); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "wrote %d account(s) to %s -- %s\n", len(store.Accounts), args[0], note)
@@ -576,14 +611,21 @@ func cmdEncrypt(f *flags, path string) error {
 	if encrypted {
 		verb = "New"
 	}
-	pass, err := readPassphrase(verb + " passphrase: ")
+	// A vault already sealed to a key keeps that binding unless it is taken
+	// off with `tpduck decrypt` first.
+	wantHardware := f.yubikey || model.VaultHardware(path).Needed
+	prompt := verb + " passphrase: "
+	if wantHardware {
+		prompt = verb + " passphrase (empty to use the YubiKey alone): "
+	}
+	pass, err := readPassphrase(prompt)
 	if err != nil {
 		return err
 	}
-	if pass == "" {
+	if pass == "" && !wantHardware {
 		return errors.New("passphrase is empty (use `tpduck decrypt` to remove encryption)")
 	}
-	if _, isEnv := os.LookupEnv("TPDUCK_PASSPHRASE"); !isEnv {
+	if _, isEnv := os.LookupEnv("TPDUCK_PASSPHRASE"); !isEnv && pass != "" {
 		again, err := readPassphrase("Confirm passphrase: ")
 		if err != nil {
 			return err
@@ -592,7 +634,7 @@ func cmdEncrypt(f *flags, path string) error {
 			return errors.New("passphrases do not match")
 		}
 	}
-	newKey, err := model.NewKey(pass)
+	newKey, err := newVaultKey(f, path, pass)
 	if err != nil {
 		return err
 	}
@@ -603,6 +645,12 @@ func cmdEncrypt(f *flags, path string) error {
 	// Any stored passphrase is stale now.
 	_ = keyring.Delete(path)
 	fmt.Fprintln(os.Stderr, "vault encrypted:", path)
+	if newKey.NeedsHardware() {
+		fmt.Fprintf(os.Stderr,
+			"sealed to the YubiKey in slot %d -- the vault file alone will not open,\n"+
+				"and there is no recovery if the key is lost. Keep a `tpduck backup -encrypt`\n"+
+				"somewhere safe before you rely on this.\n", newKey.HardwareSlot())
+	}
 	if f.useKeyring {
 		if err := keyring.Set(path, pass); err != nil {
 			fmt.Fprintln(os.Stderr, "keyring:", err)
@@ -611,6 +659,33 @@ func cmdEncrypt(f *flags, path string) error {
 		}
 	}
 	return nil
+}
+
+// newVaultKey derives the key a fresh `tpduck encrypt` should seal with,
+// keeping an existing YubiKey binding rather than quietly discarding it.
+func newVaultKey(f *flags, path, pass string) (*model.Key, error) {
+	hw := model.VaultHardware(path)
+	switch {
+	case hw.Needed && f.slotSet && f.slot != hw.Slot:
+		// Keeping the old slot here would quietly ignore what was asked for,
+		// and silently moving it would re-seal the vault to a slot that may
+		// not be programmed at all.
+		return nil, fmt.Errorf(
+			"this vault is already sealed to slot %d; run `tpduck decrypt` first to move it to slot %d",
+			hw.Slot, f.slot)
+	case f.yubikey, hw.Needed:
+		slot := f.slot
+		if hw.Needed {
+			slot = hw.Slot
+		}
+		if !yubikey.ValidSlot(slot) {
+			return nil, fmt.Errorf("-slot must be 1 or 2, got %d", slot)
+		}
+		return model.NewHardwareKey(
+			model.Unlock{Passphrase: pass, Hardware: yubikeyResponder(f.reader, slot)}, slot)
+	default:
+		return model.NewKey(pass)
+	}
 }
 
 func cmdDecrypt(f *flags, path string) error {
@@ -634,7 +709,7 @@ func cmdDecrypt(f *flags, path string) error {
 	return nil
 }
 
-func cmdKeyring(path string, args []string) error {
+func cmdKeyring(f *flags, path string, args []string) error {
 	action := "status"
 	if len(args) > 0 {
 		action = args[0]
@@ -664,7 +739,11 @@ func cmdKeyring(path string, args []string) error {
 			return err
 		}
 		// Refuse to store something that does not actually open the vault.
-		if _, k, err := model.OpenVaultFile(path, pass); err != nil {
+		u := model.Unlock{Passphrase: pass}
+		if hw := model.VaultHardware(path); hw.Needed {
+			u.Hardware = yubikeyResponder(f.reader, hw.Slot)
+		}
+		if _, k, err := model.OpenVaultFileUnlocked(path, u); err != nil {
 			return err
 		} else {
 			k.Zero()
@@ -728,7 +807,7 @@ func cmdSkew(f *flags, path string) error {
 	// the vault is locked, so a failure to open it is not fatal.
 	if store, key, err := openVault(f, path); err == nil {
 		for _, a := range store.Accounts {
-			if a.Kind() == model.TypeTOTP && a.Period > 0 && a.Period < period {
+			if a.Kind() != model.TypeHOTP && a.Period > 0 && a.Period < period {
 				period = a.Period
 			}
 		}

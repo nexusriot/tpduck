@@ -601,6 +601,30 @@ func (v *View) ConfirmDelete(acc model.Account, onDelete func(), onCancel func()
 	v.App.SetFocus(modal)
 }
 
+// ShowWaiting puts up a message with no buttons, for something that will take
+// long enough that a frozen screen would look like a crash.
+func (v *View) ShowWaiting(title, text string) {
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignCenter)
+	tv.SetText("\n" + text)
+	tv.SetBorder(true).SetTitle(" " + title + " ")
+	v.modal = true
+	v.formStatus = nil
+	v.App.SetRoot(center(60, 7, tv), true)
+}
+
+// ConfirmOne states something and offers a single way onward.
+func (v *View) ConfirmOne(title, text, okLabel string, onOK func()) {
+	modal := tview.NewModal().
+		SetText(text).
+		AddButtons([]string{okLabel}).
+		SetDoneFunc(func(int, string) { onOK() })
+	v.modal = true
+	v.App.SetRoot(center(60, 10, modal), true)
+	v.App.SetFocus(modal)
+}
+
 // Confirm asks a yes/no question.
 func (v *View) Confirm(text, okLabel string, onOK func(), onCancel func()) {
 	modal := tview.NewModal().
@@ -670,14 +694,6 @@ func (c *centered) InputHandler() func(*tcell.EventKey, func(tview.Primitive)) {
 
 func (c *centered) MouseHandler() func(tview.MouseAction, *tcell.EventMouse, func(tview.Primitive)) (bool, tview.Primitive) {
 	return c.inner.MouseHandler()
-}
-
-func shorten(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n || n < 1 {
-		return s
-	}
-	return string(r[:n-1]) + "…"
 }
 
 // params renders an account's settings compactly for the list, e.g. "6/30s" or

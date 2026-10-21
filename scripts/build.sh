@@ -56,5 +56,17 @@ done
 
 rm -f "${native}"
 
-( cd "${DIST_DIR}" && sha256sum ./*.tar.gz ./*.zip 2>/dev/null > SHA256SUMS )
+# nullglob matters: without zip installed every target falls back to a tarball,
+# and an unmatched ./*.zip would reach sha256sum as a literal filename, fail,
+# and take the whole script down with set -e.
+(
+  cd "${DIST_DIR}"
+  shopt -s nullglob
+  archives=( ./*.tar.gz ./*.zip )
+  if [ ${#archives[@]} -eq 0 ]; then
+    echo "build: no archives were produced" >&2
+    exit 1
+  fi
+  sha256sum "${archives[@]}" > SHA256SUMS
+)
 echo "wrote ${DIST_DIR}/SHA256SUMS"

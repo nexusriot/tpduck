@@ -145,6 +145,62 @@ func (s *Session) Rename(from, to string) error {
 	return err
 }
 
+// --- the applet password ----------------------------------------------------
+
+// accessKeyAlgo is the algorithm byte the applet stores an access key under:
+// the TOTP type marker plus HMAC-SHA1, which is what the key derivation above
+// produces and the only combination the applet accepts for a password.
+const accessKeyAlgo = 0x21 // 0x20 TOTP | 0x01 HMAC-SHA1
+
+// SetPassword protects the OATH applet with a password, so the credentials on
+// the key cannot be read by anyone who merely has the key in their hand.
+//
+// The password is never sent: what goes to the applet is the derived access
+// key, plus a challenge and our HMAC over it, which proves we can compute the
+// responses it will ask for later.
+func (s *Session) SetPassword(password string) error {
+	if password == "" {
+		return errors.New("password is empty (use RemovePassword to take it off)")
+	}
+	if len(s.deviceID) == 0 {
+		return errors.New("key did not report a device id")
+	}
+	access := deriveAccessKey(password, s.deviceID)
+
+	challenge := make([]byte, 8)
+	if _, err := rand.Read(challenge); err != nil {
+		return err
+	}
+	mac := hmac.New(sha1.New, access)
+	mac.Write(challenge)
+
+	data := tlv(tagKey, append([]byte{accessKeyAlgo}, access...))
+	data = append(data, tlv(tagChallenge, challenge)...)
+	data = append(data, tlv(tagResponse, mac.Sum(nil))...)
+	_, err := s.send(0x00, insSetPwd, 0x00, 0x00, data)
+	return err
+}
+
+// RemovePassword takes the password off the applet, which is an empty key TLV
+// and nothing else. The applet must already be unlocked.
+func (s *Session) RemovePassword() error {
+	_, err := s.send(0x00, insSetPwd, 0x00, 0x00, tlv(tagKey, nil))
+	return err
+}
+
+// Reset wipes the OATH applet: every credential and the password. There is no
+// undo and the key holds the only copy of each secret, so callers must have
+// asked first.
+func (s *Session) Reset() error {
+	_, err := s.send(0x00, insReset, 0xDE, 0xAD, nil)
+	if err != nil {
+		return err
+	}
+	// Whatever we were authenticated against is gone.
+	s.challenge, s.unlocked = nil, false
+	return nil
+}
+
 // --- password-protected applets --------------------------------------------
 
 // deriveAccessKey turns a password into the applet's access key, salted with

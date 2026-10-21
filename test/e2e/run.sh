@@ -98,6 +98,40 @@ check "unpin"      "unpinned" "${TP[@]}" pin gitlab
 check "order issuer" "issuer" "${TP[@]}" order issuer
 check_fails "reject bad order" "${TP[@]}" order sideways
 
+section "peeking at a code"
+PK="${WORK}/peek.json"
+tpduck -config "${PK}" add -secret JBSWY3DPEHPK3PXP -issuer Ctr -name ian -type hotp -counter 7 >/dev/null
+first=$(tpduck -config "${PK}" code -peek ctr)
+second=$(tpduck -config "${PK}" code -peek ctr)
+[ "${first}" = "${second}" ] && ok "peeking twice gives the same HOTP code" \
+  || bad "peeking twice gives the same HOTP code" "${first} then ${second}"
+tpduck -config "${PK}" list | grep -q "counter=7" \
+  && ok "peeking leaves the counter alone" || bad "peeking leaves the counter alone"
+# A peek must not touch the vault at all, so a read-only or shared vault works.
+before=$(stat -c '%s %Y' "${PK}")
+tpduck -config "${PK}" code -peek ctr >/dev/null
+[ "$(stat -c '%s %Y' "${PK}")" = "${before}" ] \
+  && ok "peeking does not write the vault" || bad "peeking does not write the vault"
+tpduck -config "${PK}" code ctr >/dev/null
+tpduck -config "${PK}" list | grep -q "counter=8" \
+  && ok "an ordinary read still advances the counter" \
+  || bad "an ordinary read still advances the counter"
+
+section "yubikey commands without a key"
+# Via check, not a pipe to grep: the suite runs under pipefail, so a pipeline
+# ending in grep still reports tpduck's own non-zero exit.
+check "yubikey password set says there is no smart-card support" \
+  "no smart-card support" tpduck yubikey password set
+check "yubikey password remove says there is no smart-card support" \
+  "no smart-card support" tpduck yubikey password remove
+check "yubikey reset says there is no smart-card support" \
+  "no smart-card support" tpduck yubikey reset -force
+check_fails "yubikey password needs an action" tpduck yubikey password
+check_fails "sealing to a key needs smart-card support" \
+  env TPDUCK_PASSPHRASE=x tpduck -config "${WORK}/seal.json" encrypt -yubikey
+check "a bad slot is refused before anything else" "slot must be 1 or 2" \
+  env TPDUCK_PASSPHRASE=x tpduck -config "${WORK}/seal.json" encrypt -yubikey -slot 9
+
 section "export"
 check "export prints a uri" "otpauth://totp/GitHub:alice" "${TP[@]}" export github
 check "export all"          "otpauth://"                  "${TP[@]}" export
@@ -252,6 +286,17 @@ tpduck -config "${VV}" rm -force keep >/dev/null 2>&1
 tpduck -config "${VV}" list | grep -q "Keep:me" && bad "account deleted" || ok "account deleted"
 check "undo restores it" "restored version" tpduck -config "${VV}" undo -force -version 1
 check "the deleted account is back" "Keep:me" tpduck -config "${VV}" list
+
+# Taking a code writes the vault too, to record the use. If that rotated the
+# retained copies, a handful of ordinary reads would push the deletion out of
+# the history and `undo` would quietly have nothing left to restore.
+VU="${WORK}/versions-use.json"
+tpduck -config "${VU}" add -secret JBSWY3DPEHPK3PXP -issuer Keep -name me >/dev/null
+tpduck -config "${VU}" add -secret JBSWY3DPEHPK3PXP -issuer Stay -name put >/dev/null
+tpduck -config "${VU}" rm -force keep >/dev/null 2>&1
+for _ in 1 2 3 4 5 6 7; do tpduck -config "${VU}" code stay >/dev/null; done
+tpduck -config "${VU}" undo -force >/dev/null 2>&1
+check "reading codes does not spend the undo history" "Keep:me" tpduck -config "${VU}" list
 
 section "backup formats"
 BF="${WORK}/formats.json"

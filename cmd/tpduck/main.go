@@ -18,6 +18,7 @@ import (
 	"github.com/nexusriot/tpduck/internal/model"
 	"github.com/nexusriot/tpduck/internal/version"
 	"github.com/nexusriot/tpduck/internal/view"
+	"github.com/nexusriot/tpduck/internal/yubikey"
 )
 
 const usage = `tpduck -- terminal TOTP/HOTP authenticator
@@ -50,6 +51,7 @@ Moving accounts in and out
 
 Vault
   tpduck encrypt | decrypt          add or remove the vault passphrase
+  tpduck encrypt -yubikey           seal the vault to a YubiKey as well
   tpduck profiles                   list named vaults (use with -p)
   tpduck agent <run|status|stop|forget>  cache the key for a few minutes
   tpduck keyring <status|set|forget>  manage the stored passphrase
@@ -58,6 +60,8 @@ Vault
 Other
   tpduck skew                       compare the system clock to network time
   tpduck yubikey <list|code|put|delete|rename>   credentials stored on a YubiKey
+  tpduck yubikey password <set|remove>  protect the key's own credentials
+  tpduck yubikey reset              wipe every credential on the key
   tpduck completion <bash|zsh|fish> print a shell completion script
   tpduck version                    print the version
   tpduck help                       this message
@@ -82,7 +86,15 @@ Flags:
   -copy              with "code": copy instead of printing
   -json              with "list": machine-readable output
   -force             do not ask for confirmation (rm, restore, undo,
-                     yubikey delete)
+                     yubikey delete/reset)
+  -peek              with "code": do not advance an HOTP counter or
+                     record the use -- the vault is not written at all
+  -yubikey           with "encrypt": seal the vault to a YubiKey too, so
+                     the file alone cannot be opened
+  -slot <1|2>        which YubiKey challenge-response slot to use
+                     (default 2)
+  -move              with "yubikey put": remove the vault's copy once the
+                     key has been shown to hold it
 
 Fields for "tpduck add" without a URI:
   -secret <base32>   the shared secret (required)
@@ -98,7 +110,12 @@ Fields for "tpduck add" without a URI:
 The passphrase for an encrypted vault is read from the terminal, from the OS
 keyring with -keyring, or from TPDUCK_PASSPHRASE when that is set (useful for
 scripts, but it exposes the passphrase to anything that can read the process
-environment).
+environment). A YubiKey's own OATH applet password is a different secret and
+comes from TPDUCK_YUBIKEY_PASSWORD.
+
+A vault sealed with -yubikey additionally needs the key it was sealed to; that
+is noticed from the vault itself, so no flag is needed to open one. It requires
+a build with smart-card support.
 `
 
 type flags struct {
@@ -120,6 +137,13 @@ type flags struct {
 	copyCode   bool
 	jsonOut    bool
 	force      bool
+	peek       bool
+	yubikey    bool
+	slot       int
+	// slotSet distinguishes "-slot 2" from the default, so re-sealing a vault
+	// can keep its existing slot without silently ignoring an explicit ask.
+	slotSet bool
+	move    bool
 
 	// account fields for "add"
 	secret  string
@@ -158,13 +182,17 @@ func main() {
 	fs.BoolVar(&f.copyCode, "copy", false, "copy the code instead of printing it")
 	fs.BoolVar(&f.jsonOut, "json", false, "machine-readable output")
 	fs.BoolVar(&f.force, "force", false, "do not ask for confirmation")
+	fs.BoolVar(&f.peek, "peek", false, "with code: do not advance an HOTP counter or record the use")
+	fs.BoolVar(&f.yubikey, "yubikey", false, "with encrypt: seal the vault to a YubiKey as well")
+	fs.IntVar(&f.slot, "slot", model.DefaultHardwareSlot, "which YubiKey challenge-response slot to use (1 or 2)")
+	fs.BoolVar(&f.move, "move", false, "with yubikey put: delete the vault copy once the key has it")
 	fs.StringVar(&f.secret, "secret", "", "Base32 secret (for add)")
 	fs.StringVar(&f.issuer, "issuer", "", "issuer (for add)")
 	fs.StringVar(&f.name, "name", "", "account name (for add)")
 	fs.StringVar(&f.algo, "algo", string(model.AlgoSHA1), "SHA1, SHA256 or SHA512 (for add)")
 	fs.IntVar(&f.digits, "digits", model.DefaultDigits, "6 or 8 (for add)")
 	fs.IntVar(&f.period, "period", model.DefaultPeriod, "seconds per code (for add)")
-	fs.StringVar(&f.otpType, "type", string(model.TypeTOTP), "totp or hotp (for add)")
+	fs.StringVar(&f.otpType, "type", string(model.TypeTOTP), "totp, hotp or steam (for add)")
 	fs.Uint64Var(&f.counter, "counter", 0, "initial HOTP counter (for add)")
 	fs.StringVar(&f.notes, "notes", "", "free-text note (for add)")
 	fs.BoolVar(&f.touch, "touch", false, "with yubikey put: require a touch to use the credential")
@@ -185,6 +213,12 @@ func main() {
 		args = append(args, rest[0])
 		rest = rest[1:]
 	}
+
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "slot" {
+			f.slotSet = true
+		}
+	})
 
 	if err := run(&f, args); err != nil {
 		fmt.Fprintln(os.Stderr, "tpduck:", err)
@@ -223,13 +257,13 @@ func run(f *flags, args []string) error {
 	case "rm", "delete":
 		return cmdRemove(f, path, rest)
 	case "pin":
-		return cmdPin(path, rest)
+		return cmdPin(f, path, rest)
 	case "order":
-		return cmdOrder(path, rest)
+		return cmdOrder(f, path, rest)
 	case "export":
 		return cmdExport(f, path, rest)
 	case "qr":
-		return cmdQR(path, rest)
+		return cmdQR(f, path, rest)
 	case "migrate":
 		return cmdMigrate(f, path)
 	case "backup":
@@ -241,13 +275,13 @@ func run(f *flags, args []string) error {
 	case "decrypt":
 		return cmdDecrypt(f, path)
 	case "keyring":
-		return cmdKeyring(path, rest)
+		return cmdKeyring(f, path, rest)
 	case "offset":
 		return cmdOffset(f, path, rest)
 	case "skew":
 		return cmdSkew(f, path)
 	case "yubikey", "yk":
-		return cmdYubikey(f, rest)
+		return cmdYubikey(f, path, rest)
 	case "agent":
 		return cmdAgent(f, path, rest)
 	case "profiles":
@@ -261,13 +295,6 @@ func run(f *flags, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (try: tpduck help)", cmd)
 	}
-}
-
-func vaultPath(override string) (string, error) {
-	if override != "" {
-		return override, nil
-	}
-	return model.DefaultConfigPath()
 }
 
 // resolveVault picks the vault: an explicit -config wins, then a -p profile,
@@ -287,6 +314,7 @@ func runTUI(f *flags, path string) error {
 		ClipClear:  f.clipClear,
 		NTPServer:  f.ntp,
 		UseKeyring: f.useKeyring,
+		Hardware:   func(slot int) model.HardwareResponder { return yubikeyResponder(f.reader, slot) },
 	})
 	if err != nil {
 		return err
@@ -297,14 +325,35 @@ func runTUI(f *flags, path string) error {
 
 // --- passphrase handling ----------------------------------------------------
 
-// readPassphrase asks the terminal, falling back to TPDUCK_PASSPHRASE.
+// Environment variables that stand in for a terminal prompt. They are separate
+// on purpose: a script that supplies the vault passphrase must not thereby
+// hand the same string to a YubiKey as its applet password.
+const (
+	envPassphrase  = "TPDUCK_PASSPHRASE"
+	envKeyPassword = "TPDUCK_YUBIKEY_PASSWORD"
+)
+
+// readPassphrase asks the terminal, falling back to envPassphrase.
 func readPassphrase(prompt string) (string, error) {
-	if p, ok := os.LookupEnv("TPDUCK_PASSPHRASE"); ok {
+	return readSecret(prompt, envPassphrase,
+		"vault is encrypted and stdin is not a terminal; set "+envPassphrase+" or use -keyring")
+}
+
+// readKeyPassword asks for a YubiKey's OATH applet password. It is a different
+// secret from the vault passphrase and reads a different variable, so an error
+// here says so rather than talking about the vault.
+func readKeyPassword(prompt string) (string, error) {
+	return readSecret(prompt, envKeyPassword,
+		"this YubiKey's OATH applet is password-protected and stdin is not a terminal; set "+envKeyPassword)
+}
+
+func readSecret(prompt, envVar, notATerminal string) (string, error) {
+	if p, ok := os.LookupEnv(envVar); ok {
 		return p, nil
 	}
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return "", errors.New("vault is encrypted and stdin is not a terminal; set TPDUCK_PASSPHRASE or use -keyring")
+		return "", errors.New(notATerminal)
 	}
 	fmt.Fprint(os.Stderr, prompt)
 	b, err := term.ReadPassword(fd)
@@ -326,6 +375,46 @@ func vaultPassphrase(f *flags, path string) (string, error) {
 	return readPassphrase("Passphrase: ")
 }
 
+// yubikeyResponder is how the vault reaches a YubiKey's challenge-response
+// slot. The connection is made when the response is actually wanted, so a key
+// is only required for vaults that ask for one.
+func yubikeyResponder(reader string, slot int) model.HardwareResponder {
+	return func(challenge []byte) ([]byte, error) {
+		s, err := yubikey.ConnectOTP(reader)
+		if err != nil {
+			return nil, err
+		}
+		defer s.Close()
+		fmt.Fprintln(os.Stderr, "asking the YubiKey (touch it if it starts blinking)...")
+		return s.ChallengeResponse(slot, challenge)
+	}
+}
+
+// unlockFor assembles what it takes to open the vault at path: a passphrase
+// when one is set, and a YubiKey responder when the vault is sealed to one.
+// The vault says which it needs, so neither is asked for unnecessarily.
+func unlockFor(f *flags, path string) (model.Unlock, error) {
+	hw := model.VaultHardware(path)
+	u := model.Unlock{}
+	if hw.Needed {
+		reader := ""
+		if f != nil {
+			reader = f.reader
+		}
+		u.Hardware = yubikeyResponder(reader, hw.Slot)
+		if hw.NoPassphrase {
+			// The token is the only factor; there is nothing to prompt for.
+			return u, nil
+		}
+	}
+	pass, err := vaultPassphrase(f, path)
+	if err != nil {
+		return u, err
+	}
+	u.Passphrase = pass
+	return u, nil
+}
+
 // openVault loads the vault, prompting only if it is actually encrypted.
 //
 // An agent, when one is running, supplies the already-derived key, which skips
@@ -345,11 +434,11 @@ func openVault(f *flags, path string) (*model.Store, *model.Key, error) {
 			return store, key, nil
 		}
 	}
-	pass, err := vaultPassphrase(f, path)
+	u, err := unlockFor(f, path)
 	if err != nil {
 		return nil, nil, err
 	}
-	store, key, err := model.OpenVaultFile(path, pass)
+	store, key, err := model.OpenVaultFileUnlocked(path, u)
 	if err != nil {
 		return nil, nil, err
 	}

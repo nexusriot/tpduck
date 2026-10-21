@@ -47,7 +47,11 @@ func SocketPath() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "tpduck-agent.sock")
 	}
-	return filepath.Join(os.TempDir(), fmt.Sprintf("tpduck-agent-%d.sock", os.Getuid()))
+	// Without a runtime directory the fallback is a shared /tmp, so the socket
+	// goes inside a directory of our own: Serve creates it 0700 before
+	// binding, which closes the window between listening and chmod in which
+	// the socket itself would be reachable by anyone on the machine.
+	return filepath.Join(os.TempDir(), fmt.Sprintf("tpduck-agent-%d", os.Getuid()), "agent.sock")
 }
 
 // request and response are the whole protocol: one JSON object each way.
@@ -98,6 +102,11 @@ func Serve(socket string, ttl time.Duration) error {
 
 	if dir := filepath.Dir(socket); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		// MkdirAll leaves an existing directory's mode alone, and the one we
+		// just made went through the umask.
+		if err := os.Chmod(dir, 0o700); err != nil {
 			return err
 		}
 	}
@@ -183,12 +192,20 @@ func (s *Server) handle(conn net.Conn) {
 			delete(s.entries, req.Vault)
 			ok = false
 		}
+		// Copy under the lock. The slice in the map is overwritten in place
+		// when the key expires or is dropped, so encoding it after unlocking
+		// could hand the client a key that turned to zeroes halfway through.
+		var key []byte
+		if ok {
+			key = append([]byte(nil), e.key...)
+		}
 		s.mu.Unlock()
 		if !ok {
 			writeResponse(conn, response{Err: ErrNoKey.Error()})
 			return
 		}
-		writeResponse(conn, response{OK: true, Key: e.key, Expires: e.expires.Format(time.RFC3339)})
+		writeResponse(conn, response{OK: true, Key: key, Expires: e.expires.Format(time.RFC3339)})
+		zero(key)
 	case "put":
 		if req.Vault == "" || len(req.Key) == 0 {
 			writeResponse(conn, response{Err: "vault and key are required"})

@@ -20,6 +20,14 @@ type helper struct {
 	write []string
 	read  []string
 	clear []string // nil means "write an empty string"
+
+	// sensitive is a write that also tells clipboard managers not to keep the
+	// content. It is nil where the tool offers no way to say so, and it is
+	// tried before `write` and fallen back from if the installed version does
+	// not understand it.
+	sensitive []string
+	// sensitiveNote explains, for a backend that cannot mark anything, why.
+	sensitiveNote string
 }
 
 // helpers is set per platform; see clipboard_unix.go and clipboard_windows.go.
@@ -62,15 +70,65 @@ var (
 	clearFn = execClear
 )
 
-// Copy puts s on the clipboard.
-func Copy(s string) error { return writeFn(s) }
+// Result says what happened to a copy: which backend took it, and whether the
+// content could be flagged so clipboard managers leave it out of their
+// history. A code that is merely cleared after fifteen seconds has still been
+// recorded by anything watching, so this is worth reporting rather than
+// assuming.
+type Result struct {
+	Helper string
+	// Sensitive is true when the backend accepted the "this is a secret"
+	// marking. False means the copy went through unmarked.
+	Sensitive bool
+	// Note explains a false Sensitive, when there is something to say.
+	Note string
+}
 
-func execWrite(s string) error {
+// Copy puts s on the clipboard, without marking it.
+func Copy(s string) error { _, err := writeFn(s, false); return err }
+
+// CopySecret puts s on the clipboard, asking the backend to keep it out of any
+// clipboard history. Where that is not possible the copy still happens, and
+// the Result says so.
+func CopySecret(s string) (Result, error) { return writeFn(s, true) }
+
+// sensitiveUnsupported remembers backends whose installed version rejected the
+// marking flag, so the fallback costs one failed exec per process rather than
+// one per copy.
+var (
+	sensitiveMu          sync.Mutex
+	sensitiveUnsupported = map[string]bool{}
+)
+
+func markingWorks(name string) bool {
+	sensitiveMu.Lock()
+	defer sensitiveMu.Unlock()
+	return !sensitiveUnsupported[name]
+}
+
+func markingFailed(name string) {
+	sensitiveMu.Lock()
+	defer sensitiveMu.Unlock()
+	sensitiveUnsupported[name] = true
+}
+
+func execWrite(s string, sensitive bool) (Result, error) {
 	h, err := find()
 	if err != nil {
-		return err
+		return Result{}, err
 	}
-	return run(h.write, s)
+	res := Result{Helper: h.name, Note: h.sensitiveNote}
+	if sensitive && len(h.sensitive) > 0 && markingWorks(h.name) {
+		if err := run(h.sensitive, s); err == nil {
+			res.Sensitive, res.Note = true, ""
+			return res, nil
+		}
+		// An older build of the tool does not know the flag. Fall through
+		// rather than failing the copy outright, and stop trying.
+		markingFailed(h.name)
+		res.Note = h.name + " is too old to mark a copy as sensitive"
+	}
+	return res, run(h.write, s)
 }
 
 // Read returns the clipboard contents. It is used to avoid clearing a clipboard
@@ -113,18 +171,23 @@ type Transient struct {
 	pending string
 }
 
-// Copy puts code on the clipboard and clears it after `after`, unless the
-// clipboard has been changed by then -- overwriting someone else's copy would
-// be worse than leaving ours. Calling Copy again cancels the previous timer.
+// Copy puts code on the clipboard, marked as sensitive where the backend can
+// say so, and clears it after `after` unless the clipboard has been changed by
+// then -- overwriting someone else's copy would be worse than leaving ours.
+// Calling Copy again cancels the previous timer.
 //
 // onClear, if non-nil, is called from the timer goroutine once the clipboard
 // has been dealt with, so a UI can say so.
-func (t *Transient) Copy(code string, after time.Duration, onClear func()) error {
-	if err := Copy(code); err != nil {
-		return err
+func (t *Transient) Copy(code string, after time.Duration, onClear func()) (Result, error) {
+	res, err := CopySecret(code)
+	if err != nil {
+		return res, err
 	}
 	if after <= 0 {
-		return nil
+		t.mu.Lock()
+		t.stopLocked()
+		t.mu.Unlock()
+		return res, nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -150,7 +213,7 @@ func (t *Transient) Copy(code string, after time.Duration, onClear func()) error
 			onClear()
 		}
 	})
-	return nil
+	return res, nil
 }
 
 // Cancel stops a pending clear without touching the clipboard. Use it when the
